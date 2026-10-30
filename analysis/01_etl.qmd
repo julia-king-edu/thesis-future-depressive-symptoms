@@ -1,0 +1,874 @@
+---
+title: "Loading, Recoding and Merging Input Datasets"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Load packages & set variables
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(labelled)
+library(here)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+
+# Initialize index dataset
+
+```{r}
+#| label: index dataset load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+index_df_raw <- load_index_df(replace_with_label = c("corigin"), release = "41")
+
+# define names of raw variables
+colnames_raw <- c(
+  "phrf", # weighting factor
+  "psample", # sample number
+  "netto", # survey status
+  "gebjahr", # birth year
+  "gebmonat", # birth month
+  "todjahr", # death year
+  "partner", # relationship status
+  "sampreg", # housing in east/west germany
+  "migback", # has migration background
+  "germborn", # born in germany
+  "immiyear" # year of immigration
+)
+
+
+# transform
+index_df <- index_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(hid, pid, syear, parid, sex, all_of(colnames_raw)) %>%
+  # transform scales
+  mutate(
+    hid = hid %>% missing_to_na(),
+    weight = phrf,
+    survey_sample = psample,
+    survey_status = netto,
+    age = syear - (gebjahr %>%
+      missing_to_na() %>%
+      replace(. < 1900, NA)),
+    death_year = todjahr %>% missing_to_na(),
+    sex = sex %>%
+      remap_values(1 ~ "male", 2 ~ "female"),
+    parid = parid %>% missing_to_na(),
+    partnership_status = partner %>%
+      remap_values(
+        0 ~ "no partner",
+        1 ~ "spouse/registered partner",
+        2 ~ "non-registered partner",
+        3 ~ "spouse/registered partner",
+        4 ~ "non-registered partner",
+        5 ~ NA
+      ),
+    housing_east_west = sampreg %>%
+      remap_values(1 ~ "West Germany", 2 ~ "East Germany"),
+    migration_background = migback %>%
+      remap_values(1 ~ "none", 2 ~ "direct", 3 ~ "indirect"),
+    born_germany = germborn %>%
+      remap_values(1 ~ TRUE, 2 ~ FALSE),
+    migration_age = ifelse(immiyear %in% c(-1, -2), # set migration age to 0 for those who have not immigrated
+      0,
+      immiyear - (syear - age)
+    )
+  ) %>%
+  # additional composite variables
+  mutate() %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# export & free memory
+save_clean_df(index_df, "ppathl")
+rm(index_df_raw, index_df, colnames_raw)
+```
+
+
+# Prepare Cleaned Joinable Datasets
+
+## personal file (pl)
+
+```{r}
+#| label: personal file load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+# import
+personal_df_raw <- load_raw_df("pl")
+
+# define names of raw variables
+colnames_raw <- c(
+  "plh0339", # depression phq4-1
+  "plh0340", # depression phq4-2
+  "plh0341", # anxiety phq4-3
+  "plh0342", # anxiety phq4-4
+  "ple0019_v1", # depression ever diagnosed
+  "plc0014_h", # individual net income
+  "plj0175", # birthcountry parents
+  "plj0048_v2", # origin_based discrimination
+  "plh0175", # satisfaction household income
+  "plm0565i11", # domestic violence attitiude
+  "pli0092_h", # frequency sport
+  "pli0059", # sleep quantity weekday
+  "pli0060", # sleep quantity weekend
+  "plh0172", # sleep satisfaction
+  "ple0011_v1", # sleep disorder
+  "ple0081_h", # smoker
+  "ple0177", # alcohol consumption
+  "pli0051", # hobbies weekday
+  "pli0036", # hobbies saturday
+  "pli0010", # hobbies sunday
+  "plh0189", # feels lonely
+  "plj0588", # feels left out
+  "plj0589", # feels isolated
+  "plh0182", # life satisfaction
+  "pli0080", # how often neighbors & friends
+  "plh0173", # job satisfaction
+  "plb0478_v1", # job change
+  "plb0193_v1", # ever work overtime
+  "plb0197", # hours overtime last month
+  "plb0206_v2", # work nights
+  "plh0176", # satisfaction personal income
+  "plh0226", # impact of stress
+  "ple0036", # chronically ill
+  "ple0016_v1", # stroke
+  "ple0007", # weight
+  "ple0006", # height
+  "ple0041_h", # degree of disability
+  "ple0008", # current health description
+  "plh0171", # current health satisfaction
+  "plh0206i11", # positive attitude towards oneself
+  "plh0216", # Worry a lot
+  "plh0221", # somewhat nervous
+  "plh0214", # sometimes too coarse with others
+  "plh0206i08", # think about experienced injustice very long
+  "plh0244", # pessimism
+  "plh0381_v2", # perceived control over life
+  "plh0379_v2", # life course depends on me
+  "plh0386_v2" # low control about important things
+)
+
+# selecting raw variables
+personal_df <- personal_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(pid, syear, all_of(colnames_raw)) %>%
+  # group by pid so there's never any spillover
+  group_by(pid) %>%
+  arrange(pid, syear) %>%
+  # depression
+  mutate(
+    ## depression phq-4
+    plh0339 = if_else(plh0339 >= 0, plh0339 - 1, NA),
+    plh0340 = if_else(plh0340 >= 0, plh0340 - 1, NA),
+    depression_phq4_score = plh0339 + plh0340,
+    depression_phq4_binary = depression_phq4_score >= 3,
+    ## depression diagnosed
+    depression_diagnosed = ple0019_v1 %>%
+      remap_values(-2 ~ FALSE, -1 ~ FALSE, 1 ~ TRUE)
+  ) %>%
+  ## leads of depression variables (see cleaning_helpers for info)
+  add_temporal_shift_columns(shift_by = 1, colname_pattern = "^depression") %>%
+  ## remove non-lead versions
+  select(-matches("depression_(?!.*1y).*", perl = TRUE)) %>%
+  # immigration
+  mutate(
+    ## child of immigrants
+    born_germany_parents = plj0175 %>% remap_values(1 ~ TRUE, 2 ~ FALSE),
+    discrimination = plj0048_v2 %>% remap_values(
+      1 ~ "often",
+      2 ~ "rarely",
+      3 ~ "never",
+      -2 ~ "never",
+      factor_ordered = TRUE
+    )
+  ) %>%
+  # income
+  mutate(
+    income_net_individual = plc0014_h %>% missing_to_na(),
+    income_satisfied_household = plh0175 %>% missing_to_na(),
+    income_satisfied_individual = plh0176 %>% missing_to_na()
+  ) %>%
+  # physical health
+  mutate(
+    height_m = (ple0006 %>% missing_to_na()) / 100,
+    height_m = ifelse(height_m >= 0.54 &
+      height_m <= 2.72, height_m, NA),
+    # limits based on shortest and tallest adult in world history
+    weight_kg = ple0007 %>% missing_to_na(),
+    weight_kg = ifelse(weight_kg >= 2.13 &
+      weight_kg <= 635, weight_kg, NA),
+    # limits based on lightest and heaviest adult in world history
+    bmi = (weight_kg) / (height_m^2),
+    obese = bmi >= 30,
+    sports_frequency = pli0092_h %>%
+      remap_values(
+        1 ~ "daily",
+        2 ~ "weekly",
+        3 ~ "monthly",
+        4 ~ "less than once a month",
+        5 ~ "never",
+        6 ~ "never",
+        8 ~ NA,
+        factor_ordered = TRUE
+      ),
+    sleep_hours_weekly = (pli0059 %>% missing_to_na()) * 5 +
+      (pli0060 %>% missing_to_na()) * 2,
+    sleep_quality = plh0172 %>% missing_to_na(),
+    sleep_disorder = ple0011_v1 %>% remap_values(
+      1 ~ TRUE,
+      -2 ~ FALSE
+    ),
+    smoker = ple0081_h %>% remap_values(1 ~ TRUE, 2 ~ FALSE),
+    alcohol_frequency = ple0177 %>%
+      remap_values(
+        1 ~ "daily",
+        2 ~ "4-6 days a week",
+        3 ~ "2-3 days a week",
+        4 ~ "2-4 days a month",
+        5 ~ "once a month or less",
+        6 ~ "never",
+        factor_ordered = TRUE
+      ),
+    chronic_illness = ple0036 %>% remap_values(1 ~ TRUE, 2 ~ FALSE),
+    disability_degree = ple0041_h %>% remap_values(
+      -2 ~ 0,
+      require_full_remap = FALSE,
+      warn_on_partial_remap = FALSE
+    ),
+    stroke_ever = ple0016_v1 %>%
+      remap_values(1 ~ TRUE, -2 ~ FALSE),
+    health_description = ple0008 %>%
+      remap_values(
+        1 ~ "very good",
+        2 ~ "good",
+        3 ~ "satisfactory",
+        4 ~ "less good",
+        5 ~ "poor",
+        factor_ordered = TRUE
+      ),
+    health_satisfaction = plh0171 %>% missing_to_na()
+  ) %>%
+  # mental health & qol
+  mutate(
+    stress_deal_well = plh0226 %>%
+      missing_to_na() %>% decrement_by(1),
+    hobbies_hours_weekly = pli0051 %>% missing_to_na() * 5 +
+      pli0036 %>% missing_to_na() +
+      pli0010 %>% missing_to_na(),
+    friends_frequency = pli0080 %>%
+      remap_values(
+        1 ~ "daily",
+        2 ~ "weekly",
+        3 ~ "monthly",
+        4 ~ "seldom",
+        5 ~ "never",
+        factor_ordered = TRUE
+      ),
+    life_satisfaction = plh0182 %>%
+      missing_to_na() %>% decrement_by(1),
+    eval_self_positive = plh0206i11 %>%
+      missing_to_na() %>% decrement_by(1),
+    feels_lonely = plh0189 %>%
+      remap_values(
+        1 ~ "agree completely",
+        2 ~ "agree",
+        3 ~ "disagree",
+        4 ~ "disagree completely",
+        factor_ordered = TRUE
+      ),
+    feels_left_out = plj0588 %>%
+      remap_values(
+        1 ~ "very often",
+        2 ~ "often",
+        3 ~ "sometimes",
+        4 ~ "seldom",
+        5 ~ "never",
+        factor_ordered = TRUE
+      ),
+    feels_isolated = plj0589 %>%
+      remap_values(
+        1 ~ "very often",
+        2 ~ "often",
+        3 ~ "sometimes",
+        4 ~ "seldom",
+        5 ~ "never",
+        factor_ordered = TRUE
+      ),
+    character_worrying = plh0216 %>%
+      missing_to_na() %>% decrement_by(1),
+    character_nervous = plh0221 %>%
+      missing_to_na() %>% decrement_by(1),
+    character_irritable = plh0214 %>%
+      missing_to_na() %>% decrement_by(1),
+    character_rumination = plh0206i08 %>%
+      missing_to_na() %>% decrement_by(1),
+    character_optimism = plh0244 %>%
+      remap_values(
+        1 ~ "optimistic",
+        2 ~ "somewhat optimistic",
+        3 ~ "somewhat pessimistic",
+        4 ~ "pessimistic",
+        factor_ordered = TRUE
+      ),
+    belief_others_control_life = plh0381_v2 %>%
+      missing_to_na() %>% decrement_by(1),
+    belief_self_shapes_destiny = plh0379_v2 %>%
+      missing_to_na() %>% decrement_by(1),
+    belief_little_control_life = plh0386_v2 %>%
+      missing_to_na() %>% decrement_by(1)
+  ) %>%
+  # work
+  mutate(
+    job_satisfaction = plh0173 %>% missing_to_na(),
+    # 10 step likert scale
+    job_changed = plb0478_v1 %>%
+      remap_values(1 ~ TRUE, 2 ~ TRUE, -2 ~ FALSE),
+    # helper variable for grouping
+    job_nr_individual = job_changed %>%
+      replace_na(FALSE) %>%
+      cumsum() %>%
+      decrement_by(-1),
+    # increment by 1 so it starts at 1
+    overtime_ever = plb0193_v1 %>%
+      remap_values(1 ~ TRUE, 2 ~ FALSE, 3 ~ NA),
+    overtime_hours_month = plb0197 %>% remap_values(
+      -2 ~ 0,
+      require_full_remap = FALSE,
+      warn_on_partial_remap = FALSE
+    ),
+    work_nights = plb0206_v2 %>%
+      remap_values(
+        2 ~ "every day",
+        3 ~ "several times a week",
+        4 ~ "on weekly basis",
+        5 ~ "rarely",
+        1 ~ "never",
+        factor_ordered = TRUE
+      )
+  ) %>%
+  # ungroup
+  ungroup() %>%
+  # add static "data present" variable for tracking
+  mutate(data_personal = TRUE) %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# separate partner_violence_df
+partner_violence_risk_df <- personal_df_raw %>%
+  select(pid, syear, plm0565i11) %>%
+  mutate(partner_violence_risk = plm0565i11 %>% missing_to_na()) %>%
+  select(-plm0565i11)
+
+
+# export & free memory
+save_clean_df(personal_df, "pl")
+save_clean_df(partner_violence_risk_df, "pvr", ignore_no_raw_equivalent = TRUE)
+rm(
+  personal_df_raw,
+  personal_df,
+  partner_violence_risk_df,
+  colnames_raw
+)
+```
+
+## generated personal file (pgen)
+
+```{r}
+#| label: personal generated file load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+# import
+personal_gen_df_raw <- load_raw_df("pgen")
+
+# define names of raw variables
+colnames_raw <- c(
+  "pgisced11",
+  # International Standard Classification of Education
+  "pgstib" # occupational position
+)
+
+# transform
+personal_gen_df <- personal_gen_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(pid, syear, all_of(colnames_raw)) %>%
+  # transform scales
+  mutate(
+    education_level = pgisced11 %>%
+      remap_values(
+        0 ~ "in school",
+        1 ~ "primary",
+        2 ~ "secondary",
+        3 ~ "secondary",
+        4 ~ "Post-secondary non-tertiary",
+        5 ~ "tertiary",
+        6 ~ "tertiary",
+        7 ~ "tertiary",
+        8 ~ "tertiary"
+      ),
+    occupation_position = if_else(pgstib >= 100, floor(pgstib / 100), pgstib) %>%
+      remap_values(
+        1 ~ "education/training",
+        2 ~ "manual labour",
+        3 ~ "manual labour",
+        4 ~ "self-employed",
+        5 ~ "employee",
+        6 ~ "civil service",
+        10 ~ "not employed",
+        11 ~ "education/training",
+        12 ~ "not employed",
+        13 ~ "retired",
+        14 ~ "retired",
+        15 ~ "military/community service"
+      )
+  ) %>%
+  # additional composite variables
+  mutate(unemployed = case_when(
+    occupation_position %in% c("not employed") ~ TRUE,
+    is.na(occupation_position) ~ NA,
+    TRUE ~ FALSE
+  )) %>%
+  # add static "data present" variable for tracking
+  mutate(data_pgen = TRUE) %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# export & free memory
+save_clean_df(personal_gen_df, "pgen")
+rm(personal_gen_df_raw, personal_gen_df, colnames_raw)
+```
+
+## household file (hl)
+
+```{r}
+#| label: household file load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+# import
+household_df_raw <- load_raw_df("hl")
+
+# define names of raw variables
+colnames_raw <- c(
+  "hlf0135", # distance to city centre
+  "hlc0021_h", # minimum income that would be enough for hh
+  "hlf0001_h", # tenant/owner
+  "hlf0291", # person requiring help in hh
+  "hlf0153_h", # neighbourhood type
+  "hlf0184", # is this a good neighbourhood
+  "hlf0152", # residents know each other
+  "hlf0149", # noise pollution
+  "hlf0148", # air pollution
+  "hlf0150", # too little green space
+  "hlf0151" # feel safe
+)
+
+# transform
+household_df <- household_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(hid, syear, all_of(colnames_raw)) %>%
+  # transform scales
+  ## household facts
+  mutate(
+    housing_status = hlf0001_h %>%
+      remap_values(
+        1 ~ "main tenant",
+        2 ~ "sub tenant",
+        3 ~ "owner",
+        4 ~ "nursing/retirement home",
+        5 ~ "main tenant"
+      ),
+    income_min_sufficient = hlc0021_h %>%
+      missing_to_na(),
+    household_carework = hlf0291 %>%
+      remap_values(1 ~ TRUE, 2 ~ FALSE)
+  ) %>%
+  ## location & non-human neighbourhood factors
+  mutate(
+    distance_city_centre = hlf0135 %>%
+      remap_values(
+        6 ~ "60+ km",
+        5 ~ "40 - 60 km",
+        4 ~ "25 - 40 km",
+        3 ~ "10 - 25 km",
+        2 ~ "0 - 10 km",
+        1 ~ "0 km",
+        factor_ordered = TRUE
+      ),
+    neighbourhood_type = hlf0153_h %>%
+      remap_values(
+        1 ~ "residential area, old buildings",
+        2 ~ "residential area, new buildings",
+        3 ~ "mixed area, flats, houses and shops",
+        4 ~ "commercial area",
+        5 ~ "industrial area",
+        6 ~ "other"
+      ),
+    neighbourhood_pollution_noise = hlf0149 %>%
+      remap_values(
+        5 ~ "very strong",
+        4 ~ "strong",
+        3 ~ "bearable",
+        2 ~ "little",
+        1 ~ "none",
+        factor_ordered = TRUE
+      ),
+    neighbourhood_pollution_air = hlf0148 %>%
+      remap_values(
+        5 ~ "very strong",
+        4 ~ "strong",
+        3 ~ "bearable",
+        2 ~ "little",
+        1 ~ "none",
+        factor_ordered = TRUE
+      ),
+    neighbourhood_greenspace_insufficient = hlf0150 %>%
+      remap_values(
+        5 ~ "very strong",
+        4 ~ "strong",
+        3 ~ "bearable",
+        2 ~ "little",
+        1 ~ "no",
+        factor_ordered = TRUE
+      )
+  ) %>%
+  ## human neighbourhood factors
+  mutate(
+    neighbourhood_eval_good = hlf0184 %>%
+      remap_values(1 ~ TRUE, 2 ~ FALSE),
+    neighbourhood_cohesion = hlf0152 %>%
+      remap_values(
+        1 ~ "hardly know each other",
+        2 ~ "talk occasionally",
+        3 ~ "close bond",
+        4 ~ "varied"
+      ),
+    neighbourhood_feel_safe = hlf0151 %>%
+      remap_values(
+        1 ~ "Very Safe",
+        2 ~ "Relatively Safe",
+        3 ~ "Relatively Unsafe",
+        4 ~ "Very Unsafe",
+        factor_ordered = TRUE
+      )
+  ) %>%
+  # add static "data present" variable for tracking
+  mutate(data_household = TRUE) %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# export & free memory
+save_clean_df(household_df, "hl")
+rm(household_df_raw, household_df, colnames_raw)
+```
+
+## household generated file (hgen)
+
+```{r}
+#| label: household generated file load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+# import
+household_gen_df_raw <- load_raw_df("hgen")
+
+# define names of raw variables
+colnames_raw <- c(
+  "hghinc", # net household income
+  "hgmoveyr" # year moved into dwelling
+)
+
+# transform
+household_gen_df <- household_gen_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(hid, syear, all_of(colnames_raw)) %>%
+  # transform scales
+  mutate(
+    job_nr_household = NA, # adding later in 02_missingness
+    income_net_household = hghinc %>%
+      missing_to_na(),
+    housing_moved_in_year = hgmoveyr %>%
+      missing_to_na(),
+  ) %>%
+  # add static "data present" variable for tracking
+  mutate(data_hgen = TRUE) %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# export & free memory
+save_clean_df(household_gen_df, "hgen")
+rm(household_gen_df_raw, household_gen_df, colnames_raw)
+```
+
+## household gross data (hbrutto)
+
+```{r}
+#| label: household gross file load & clean
+#| fig-width: 10
+#| fig-height: 10
+
+# import
+household_gross_df_raw <- load_raw_df("hbrutto")
+
+# define names of raw variables
+colnames_raw <- c(
+  "hhgr" # household size
+)
+
+# transform
+household_gross_df <- household_gross_df_raw %>%
+  # select only relevant variables (helps with performance)
+  select(hid, syear, all_of(colnames_raw)) %>%
+  # transform scales
+  mutate(
+    household_size = hhgr %>%
+      missing_to_na(),
+    household_single = ifelse(household_size == 1,
+      TRUE,
+      FALSE
+    )
+  ) %>%
+  # add static "data present" variable for tracking
+  mutate(data_hgross = TRUE) %>%
+  # drop raw variables
+  select(!all_of(colnames_raw))
+
+# export & free memory
+save_clean_df(household_gross_df, "hbrutto")
+rm(household_gross_df_raw, household_gross_df, colnames_raw)
+```
+
+# Join
+
+## index dataset
+
+```{r}
+#| label: load cleaned index dataset
+#| fig-width: 10
+#| fig-height: 10
+
+merged_df <- load_clean_df("ppathl")
+```
+
+## personal file
+
+```{r}
+#| label: merge personal df
+#| fig-width: 10
+#| fig-height: 10
+
+personal_df <- load_clean_df("pl")
+partner_violence_risk_df <- load_clean_df("pvr")
+
+merged_df <- merged_df %>%
+  left_join(personal_df,
+    by = join_by(pid, syear)
+  ) %>%
+  left_join(partner_violence_risk_df,
+    by = join_by(parid == pid, syear)
+  )
+
+rm(
+  personal_df,
+  partner_violence_risk_df
+)
+```
+
+## generated personal file
+
+```{r}
+#| label: merge personal generated df
+#| fig-width: 10
+#| fig-height: 10
+
+personal_gen_df <- load_clean_df("pgen")
+
+merged_df <- merged_df %>%
+  left_join(personal_gen_df,
+    by = join_by(pid, syear)
+  )
+
+rm(personal_gen_df)
+```
+
+## household file
+
+```{r}
+#| label: merge household df
+#| fig-width: 10
+#| fig-height: 10
+
+household_df <- load_clean_df("hl")
+
+merged_df <- merged_df %>%
+  left_join(household_df,
+    by = join_by(hid, syear)
+  )
+
+rm(household_df)
+```
+
+## generated household file
+
+```{r}
+#| label: merge generated household df
+#| fig-width: 10
+#| fig-height: 10
+
+household_gen_df <- load_clean_df("hgen")
+
+merged_df <- merged_df %>%
+  left_join(household_gen_df,
+    by = join_by(hid, syear)
+  )
+
+rm(household_gen_df)
+```
+
+## gross household file
+
+```{r}
+#| label: merge gross household df
+#| fig-width: 10
+#| fig-height: 10
+
+household_gross_df <- load_clean_df("hbrutto")
+
+merged_df <- merged_df %>%
+  left_join(household_gross_df,
+    by = join_by(hid, syear)
+  )
+
+rm(household_gross_df)
+```
+
+## reorder & export
+
+```{r}
+#| label: order & export
+#| fig-width: 10
+#| fig-height: 10
+
+colnames_ordered <- c(
+  # identifiers & metadata
+  "pid",
+  "syear",
+  "hid",
+  "weight",
+  "survey_sample",
+  "survey_status",
+  "parid",
+  "data_personal",
+  "data_pgen",
+  "data_household",
+  "data_hgen",
+  "data_hgross",
+  "housing_moved_in_year",
+  "job_nr_individual",
+  "job_nr_household",
+
+  # depression variables
+  "depression_phq4_score_in_1y",
+  "depression_phq4_binary_in_1y",
+  "depression_diagnosed_in_1y",
+
+  # sociodemographic
+  "age",
+  "death_year",
+  "sex",
+  "partnership_status",
+  "education_level",
+  "migration_background",
+  "born_germany_parents",
+  "born_germany",
+  "migration_age",
+  "discrimination",
+
+  # household
+  "housing_status",
+  "household_single",
+  "household_size",
+  "household_carework",
+  "partner_violence_risk",
+
+  # finances
+  "income_net_household",
+  "income_net_individual",
+  "income_satisfied_household",
+  "income_satisfied_individual",
+  "income_min_sufficient",
+
+  # lifestyle/behavioural
+  "sports_frequency",
+  "smoker",
+  "alcohol_frequency",
+  "hobbies_hours_weekly",
+  "friends_frequency",
+  "sleep_hours_weekly",
+  "sleep_quality",
+  "sleep_disorder",
+
+  # employment
+  "occupation_position",
+  "unemployed",
+  "job_satisfaction",
+  "job_changed",
+  "overtime_ever",
+  "overtime_hours_month",
+  "work_nights",
+
+  # physical health
+  "health_description",
+  "health_satisfaction",
+  "height_m",
+  "weight_kg",
+  "bmi",
+  "obese",
+  "chronic_illness",
+  "disability_degree",
+  "stroke_ever",
+
+  # mental health
+  "life_satisfaction",
+  "eval_self_positive",
+  "stress_deal_well",
+  "feels_lonely",
+  "feels_left_out",
+  "feels_isolated",
+  "character_worrying",
+  "character_nervous",
+  "character_irritable",
+  "character_rumination",
+  "character_optimism",
+  "belief_others_control_life",
+  "belief_self_shapes_destiny",
+  "belief_little_control_life",
+
+  # neighbourhood/environment
+  "housing_east_west",
+  "distance_city_centre",
+  "neighbourhood_type",
+  "neighbourhood_pollution_noise",
+  "neighbourhood_pollution_air",
+  "neighbourhood_greenspace_insufficient",
+  "neighbourhood_eval_good",
+  "neighbourhood_cohesion",
+  "neighbourhood_feel_safe"
+)
+
+merged_df <- merged_df %>%
+  relocate(all_of(colnames_ordered))
+
+save_clean_df(merged_df, "merged", ignore_no_raw_equivalent = TRUE)
+```

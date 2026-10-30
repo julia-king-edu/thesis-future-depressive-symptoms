@@ -1,0 +1,1166 @@
+---
+title: "Missingness - Deterministic Reconstruction"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load packages & set variables
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(ggthemes)
+library(zoo)
+library(DT)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+# Load merged dataset & drop unusable pid's & years
+
+```{r}
+#| label: load df & drop unusable
+
+sparse_df <- load_clean_df("merged") # called sparse cause i didnt fill anything yet
+
+n_before <- sparse_df %>%
+  pull(pid) %>%
+  unique() %>%
+  length()
+
+# I drop all pid's that never responded to the phq4 questions, as i dont have a depvar to work with for those cases
+sparse_df <- sparse_df %>%
+  group_by(pid) %>%
+  filter(any(!is.na(depression_phq4_score_in_1y))) %>%
+  ungroup()
+
+# I also drop all years before 2013 as 2016 was the first measure of phq4, so 2013 is the first year where the "depressive score in 3 years" value can have entries. I keep 2 years beforehand for now tho to extrapolate to 2013 if necessary
+sparse_df <- sparse_df %>% filter(syear >= 2011)
+
+# Lastly, I drop all entries where death_year < syear, this can happen cause they sometimes obtain death-specific data
+sparse_df <- sparse_df %>%
+  filter((is.na(death_year) |
+    death_year >= syear))
+
+
+n_after <- sparse_df %>%
+  pull(pid) %>%
+  unique() %>%
+  length()
+print(
+  paste(
+    "Nr. of PID's remaining: ",
+    n_after,
+    ", corresponding to ",
+    round(n_after / n_before * 100, 2),
+    "% of all pid's.",
+    sep = ""
+  )
+)
+
+rm(n_before, n_after)
+```
+
+# Depressive Prevalence Testing
+
+```{r}
+#| label: prevalence table
+
+sparse_df %>%
+  drop_na(depression_phq4_binary_in_1y) %>%
+  # count & prepare
+  count(syear,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  group_by(syear) %>%
+  mutate(
+    prevalence = n / sum(n),
+    prevalence = scales::percent(prevalence, accuracy = 0.01)
+  ) %>%
+  ungroup() %>%
+  mutate(syear = syear + 1) %>% # to print the actual years of depression
+  filter(depression_phq4_binary_in_1y) %>%
+  select("Year" = syear, "Prevalence" = prevalence) %>%
+  export_return(
+    "02_depression_prevalence_year",
+    caption = "Reports the percentage of individuals displaying depressive symptoms above the PHQ-2 threshold in the given year.",
+    label = "depression_prevalence_year",
+    tabular.environment = "tabular",
+    align = c("l", "r"),
+    digits = c(0, 0, 2)
+  )
+```
+
+```{r}
+#| label: visualize distribution
+#| fig-width: 5
+#| fig-height: 5
+
+prevalence_labels <- sparse_df %>%
+  drop_na(depression_phq4_score_in_1y, depression_phq4_binary_in_1y) %>%
+  count(depression_phq4_binary_in_1y, wt = weight) %>%
+  mutate(
+    share = n / sum(n),
+    label = paste0(
+      if_else(depression_phq4_binary_in_1y, "Above Cutoff", "Below Cutoff"),
+      " (", scales::percent(share, accuracy = 0.1), ")"
+    )
+  )
+
+# combine dfs with indicator
+sparse_df %>%
+  drop_na(depression_phq4_score_in_1y, depression_phq4_binary_in_1y) %>%
+  # count & prepare
+  count(depression_phq4_score_in_1y,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  mutate(share = n / sum(n)) %>%
+  # plot
+  ggplot(aes(x = depression_phq4_score_in_1y, y = share, fill = depression_phq4_binary_in_1y)) +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(share, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 4,
+    fill = "white"
+  ) +
+  scale_x_continuous(breaks = seq(0, 6, 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.5)) +
+  theme_minimal() +
+  theme(legend.position = "top", legend.direction = "horizontal") +
+  scale_fill_manual(
+    values = c("TRUE" = palette_qualitative[1], "FALSE" = palette_qualitative[2]),
+    labels = setNames(
+      prevalence_labels$label,
+      prevalence_labels$depression_phq4_binary_in_1y
+    )
+  ) +
+  # guides(fill = "none") +
+  labs(
+    x = "Symptom Score",
+    y = "Prevalence",
+    fill = "",
+    title = "Distribution of Symptom Scores in the Population",
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "02_depression_distribution",
+    width = 5,
+    height = 5
+  )
+```
+
+```{r}
+#| label: visualize distribution over time
+#| fig-width: 10
+#| fig-height: 10
+
+# combine dfs with indicator
+sparse_df %>%
+  drop_na(depression_phq4_score_in_1y, depression_phq4_binary_in_1y) %>%
+  # count & prepare
+  count(syear,
+    depression_phq4_score_in_1y,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  mutate(syear = syear + 1) %>% # to plot the year of depressive symptoms instead of predictor year
+  group_by(syear) %>%
+  mutate(share = n / sum(n)) %>%
+  # plot
+  ggplot(aes(x = depression_phq4_score_in_1y, y = share, fill = depression_phq4_binary_in_1y)) +
+  facet_wrap(~syear, scales = "free_x") +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(share, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 4,
+    fill = "white"
+  ) +
+  scale_x_continuous(breaks = seq(0, 6, 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.5)) +
+  theme_minimal() +
+  theme(legend.position = "top", legend.direction = "horizontal") +
+  scale_fill_manual(
+    values = c("TRUE" = palette_qualitative[1], "FALSE" = palette_qualitative[2]),
+    labels = c("FALSE" = "Below Cutoff", "TRUE" = "Above Cutoff")
+  ) +
+  # guides(fill = "none") +
+  labs(
+    x = "Symptom Score",
+    y = "Prevalence",
+    fill = "",
+    title = "Distribution of Symptom Scores in the Population",
+    subtitle = "Scores provided for all years of measurement.",
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "02_depression_distribution_year",
+    width = 10,
+    height = 10
+  )
+```
+
+# Visualize Missingness
+
+```{r}
+#| label: overall missingness
+
+sparse_df %>%
+  select(depression_phq4_binary_in_1y, age, sex:last_col()) %>%
+  summarise(missing = mean(is.na(as.matrix(.))) * 100)
+```
+
+## variable-based
+
+```{r}
+#| label: visualize missingness per variable
+#| fig-height: 9
+#| fig-width: 10
+
+sparse_df %>%
+  select(syear, depression_phq4_binary_in_1y, age, sex:last_col()) %>%
+  filter(syear >= 2013) %>%
+  na_heatmap_variables(bold_variables = c("smoker")) -
+  partial(export_return, filename = "02_na-heatmap-variables_sparse", width = 10, height = 9)
+```
+
+## sample number based
+
+```{r}
+#| label: missingness by sample number
+#| fig-height: 10
+#| fig-width: 10
+
+# implementation moved to visualization.R
+
+na_heatmap_groups(
+  sparse_df %>%
+    select(
+      survey_sample,
+      syear,
+      depression_phq4_binary_in_1y,
+      age,
+      sex:last_col()
+    ),
+  y = "survey_sample"
+) -
+  partial(export_return,
+    filename = "02_na-heatmap-survey-sample_sparse",
+    width = 10,
+    height = 10
+  )
+```
+
+-\> no super clear ones to omit based on missingness.
+
+# drop variables
+
+## too little data available
+
+all variables with \<= 1 year of observations starting at 2015 are dropped, as there is too little data to extrapolate from. "Insights" generated by reconstructed and imputed versions of these variables are likely to be artifacts of the techniques applied.
+
+```{r}
+#| label: drop too little data
+
+# detect variables with >= 1 year of data beginning at 2015
+vars_no_data <- sparse_df %>%
+  select(pid, syear, age:last_col()) %>% # only consider predictor candidates
+  filter(syear >= 2015) %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(
+    cols = -c(pid, syear),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(syear, variable) %>%
+  summarise(
+    any_non_na = any(!is.na(value)),
+    .groups = "drop"
+  ) %>%
+  group_by(variable) %>%
+  summarize(drop = if_else(sum(any_non_na) < 2, TRUE, FALSE)) %>%
+  filter(drop == TRUE) %>%
+  pull(variable)
+
+sparse_df <- sparse_df %>%
+  select(-all_of(vars_no_data))
+```
+
+## irrelevant / inferior variables
+
+- death_year: all dead people have been excluded
+- born_germany_parents: collinearity with migback: none -\> TRUE here, direct & indirect -\> FALSE here
+- born_germany: collinearity with migback: none & indirect -\> TRUE here, direct -\> FALSE here
+- job_changed: information preserved in job_nr_individual
+
+```{r}
+#| label: drop irrelevant
+
+sparse_df <- sparse_df %>%
+  select(-c(
+    born_germany_parents,
+    born_germany,
+    death_year,
+    job_changed
+  ))
+```
+
+# Fill grouping variables
+
+## housing moved in year
+
+critical to do first, as it allows grouping by person and dwelling (important for filling variables such as "how big is your flat" from other years in the same dwelling)
+
+### procedure: fill if identical
+
+get all move years, for each value fill upwards, then fill with first syear of person
+
+1.  get all move years, ex 2012 and 2016
+2.  for a missing value, fill in the highest move year that isnt higher than syear
+3.  for all where syear \<= min, create arbitrary value (min(syear) for example) to group by
+
+### apply procedure
+
+```{r}
+#| label: fill housing moved
+
+# apply procedure:
+moved_df <- sparse_df %>%
+  group_by(pid) %>%
+  # fill upwards
+  arrange(pid, syear) %>%
+  mutate(housing_temp = housing_moved_in_year) %>%
+  fill(housing_temp, .direction = "up") %>%
+  mutate(housing_moved_in_year = if_else(
+    housing_temp <= syear,
+    housing_temp,
+    housing_moved_in_year
+  )) %>%
+  select(-housing_temp) %>%
+  # fill all trailing na's with last move &
+  # fill all na's in middle with latest move at that point
+  fill(housing_moved_in_year, .direction = "down") %>%
+  # only remaining NA are now leading na's -> replace with min(syear) to obtain a valid grouping for them (this variable is not used in the analysis later so this value could also be any arbitrary value)
+  mutate(housing_moved_in_year = if_else(
+    is.na(housing_moved_in_year),
+    min(syear),
+    housing_moved_in_year
+  )) %>%
+  ungroup()
+
+print_missingness_reduction(moved_df, sparse_df)
+```
+
+## job nr individual/household
+
+### procedure: fill downward & summarize
+
+some pid-syear combinations are present in the "base" df (ppathl, intended as base for joining), but not in the individual-level datasets. this can occur if no personal interview was conducted but household variables were still gathered (person usually isnt the head of the household in that case). This is the case for `r round(nrow(moved_df %>% filter(is.na(data_personal))) / nrow(moved_df) * 100, 2)`% of all pid/syear combinations present in the dataset.
+
+This can be fixed by filling downwards. This carries the same assumptions as before: we only increment job_nr if job_changed is true, it remains the same for NA and FALSE. Thus, we assume that job changes are indicated, if not in the missing year, then in the following one.
+
+household job nr can be computed by sum(job_nr_individual) grouped by hid, syear.
+
+### apply procedure
+
+```{r}
+#| label: fill job nr
+
+# do individual job nr.
+job_nr_df <- moved_df %>%
+  group_by(pid) %>%
+  arrange(pid, syear) %>%
+  fill(job_nr_individual, .direction = "down") %>%
+  ungroup()
+
+job_nr_df <- job_nr_df %>%
+  left_join(
+    job_nr_df %>%
+      # create join df that only contains the household variable & joins
+      select(hid, syear, job_nr_individual) %>%
+      group_by(hid, syear) %>%
+      # increases by 1 every time someone in household changes job
+      summarize(temp = sum(job_nr_individual, na.rm = TRUE), .groups = "drop") %>%
+      group_by(hid) %>%
+      # normalization, not really necessary, but ensures job_nr_household always starts at 1
+      mutate(temp = temp - min(temp, na.rm = TRUE) + 1),
+    by = join_by(hid, syear)
+  ) %>%
+  mutate(
+    job_nr_household = if_else(!is.na(hid),
+      temp,
+      NA
+    ),
+    temp = NULL
+  )
+
+
+print_missingness_reduction(job_nr_df, moved_df) %>% print()
+```
+
+# Fill regular variables
+
+## stable variables
+
+### procedure: fill with mode
+
+these variables are fixed within their grouping.
+
+### variables
+
++---------------+----------------------+
+| Dependent on  | Variables            |
++===============+======================+
+| pid           | height_m             |
++---------------+----------------------+
+| pid + house   | neighbourhood_type\  |
+|               | housing_east_west\   |
+|               | distance_city_centre |
++---------------+----------------------+
+| pid + job     | occupation_position  |
++---------------+----------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill stable
+
+# apply procedure:
+stable_df <- job_nr_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  mutate(height_m = mode(height_m, na.rm = TRUE)) %>%
+  ungroup() %>%
+  # grouped by person and dwelling
+  group_by(pid, housing_moved_in_year) %>%
+  mutate(
+    neighbourhood_type = mode(neighbourhood_type, na.rm = TRUE),
+    housing_east_west = mode(housing_east_west, na.rm = TRUE),
+    distance_city_centre = mode(distance_city_centre, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and job of the person
+  group_by(pid, job_nr_individual) %>%
+  mutate(occupation_position = mode(occupation_position, na.rm = TRUE)) %>%
+  ungroup()
+
+print_missingness_reduction(stable_df, job_nr_df)
+```
+
+## variables stable over short periods
+
+### procedure: impute last known variable with limit
+
+these variables are not expected to exhibit frequent changes. thus, they are filled downwards for 2 years max.
+
+### variables
+
++---------------+------------------+
+| Dependent on  | Variables        |
++===============+==================+
+| pid           | chronic_illness\ |
+|               | character\_      |
++---------------+------------------+
+| pid + house   | housing_status   |
++---------------+------------------+
+| pid + hid     | housing_carework |
++---------------+------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill stable over short periods
+
+# apply procedure:
+short_df <- stable_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  fill_n(chronic_illness, character_optimism, character_rumination, character_irritable, character_nervous, character_worrying,
+    .direction = "down", .n = 2, .time = "syear"
+  ) %>%
+  ungroup() %>%
+  # grouped by person and dwelling
+  group_by(pid, housing_moved_in_year) %>%
+  fill_n(housing_status,
+    .direction = "down", .n = 2, .time = "syear"
+  ) %>%
+  ungroup() %>%
+  # grouped by person and household number
+  group_by(pid, hid) %>%
+  fill_n(household_carework,
+    .direction = "down", .n = 2, .time = "syear"
+  ) %>%
+  ungroup()
+
+print_missingness_reduction(short_df, stable_df)
+```
+
+## ordinal, unidirectional
+
+### procedure: impute last known value
+
+education_level can only ever increase, meaning last years value is the minimum it can be.
+
+### variables
+
++---------------+------------------+
+| Dependent on  | Variables        |
++===============+==================+
+| pid           | education_level\ |
+|               | stroke_ever      |
++---------------+------------------+
+| pid + house   |                  |
++---------------+------------------+
+| pid + job     |                  |
++---------------+------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill unidirectional
+
+# apply procedure:
+unidirectional_df <- short_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  fill(education_level, stroke_ever, .direction = "down") %>%
+  ungroup()
+
+print_missingness_reduction(unidirectional_df, short_df)
+```
+
+## continuous, major jumps unlikely
+
+### procedure: linear interpolation
+
+these variables tend have high inertia and progress slowly, if at all.
+
+### variables
+
++---------------+-----------------------+
+| Dependent on  | Variables             |
++===============+=======================+
+| pid           | hobbies_hours_weekly\ |
+|               | sleep_hours_weekly\   |
+|               | weight_kg\            |
+|               | disability_degree     |
++---------------+-----------------------+
+| pid + house   |                       |
++---------------+-----------------------+
+| pid + job     | income_net\           |
+|               | overtime_hours_month  |
++---------------+-----------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill continuous
+
+# apply procedure:
+continuous_df <- unidirectional_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  mutate(
+    hobbies_hours_weekly = hobbies_hours_weekly %>%
+      na.approx(x = syear, na.rm = FALSE),
+    sleep_hours_weekly = sleep_hours_weekly %>%
+      na.approx(x = syear, na.rm = FALSE),
+    weight_kg = weight_kg %>%
+      na.approx(x = syear, na.rm = FALSE),
+    disability_degree = disability_degree %>%
+      na.approx(x = syear, na.rm = FALSE)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and job of the person
+  group_by(pid, job_nr_individual) %>%
+  mutate(
+    income_net_individual = income_net_individual %>%
+      na.approx(x = syear, na.rm = FALSE),
+    overtime_hours_month = overtime_hours_month %>%
+      na.approx(x = syear, na.rm = FALSE)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and household jobs
+  group_by(pid, job_nr_household) %>%
+  mutate(income_net_household = income_net_household %>%
+    na.approx(x = syear, na.rm = FALSE)) %>%
+  ungroup()
+
+print_missingness_reduction(continuous_df, unidirectional_df)
+```
+
+## likert scales, major jumps unlikely
+
+### procedure: linear interpolation with rounding
+
+these variables tend have high inertia and progress slowly, if at all. rounding is done to preserve scale
+
+### variables
+
++---------------+----------------------+
+| Dependent on  | Variables            |
++===============+======================+
+| pid           | sleep_quality\       |
+|               | health_description\  |
+|               | health_satisfaction\ |
+|               | life_satisfaction\   |
+|               | eval_self_positive\  |
+|               | stress_deal_well\    |
+|               | feels\_\             |
+|               | belief\_             |
++---------------+----------------------+
+| pid + house   | neighbourhood\_      |
++---------------+----------------------+
+| pid + job     | income_satisfied\    |
+|               | job_satisfaction     |
++---------------+----------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill likert
+
+# apply procedure:
+likert_df <- continuous_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  mutate(
+    sleep_quality = sleep_quality %>%
+      interpolate_likert(time_col = syear),
+    health_description = health_description %>%
+      interpolate_likert(time_col = syear),
+    health_satisfaction = health_satisfaction %>%
+      interpolate_likert(time_col = syear),
+    life_satisfaction = life_satisfaction %>%
+      interpolate_likert(time_col = syear),
+    eval_self_positive = eval_self_positive %>%
+      interpolate_likert(time_col = syear),
+    stress_deal_well = stress_deal_well %>%
+      interpolate_likert(time_col = syear),
+    feels_lonely = feels_lonely %>%
+      interpolate_likert(time_col = syear),
+    feels_left_out = feels_left_out %>%
+      interpolate_likert(time_col = syear),
+    feels_isolated = feels_isolated %>%
+      interpolate_likert(time_col = syear),
+    belief_others_control_life = belief_others_control_life %>%
+      interpolate_likert(time_col = syear),
+    belief_self_shapes_destiny = belief_self_shapes_destiny %>%
+      interpolate_likert(time_col = syear),
+    belief_little_control_life = belief_little_control_life %>%
+      interpolate_likert(time_col = syear)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and dwelling
+  group_by(pid, housing_moved_in_year) %>%
+  mutate(
+    neighbourhood_pollution_noise = neighbourhood_pollution_noise %>%
+      interpolate_likert(time_col = syear),
+    neighbourhood_pollution_air = neighbourhood_pollution_air %>%
+      interpolate_likert(time_col = syear),
+    neighbourhood_greenspace_insufficient = neighbourhood_greenspace_insufficient %>%
+      interpolate_likert(time_col = syear),
+    neighbourhood_cohesion = neighbourhood_cohesion %>%
+      interpolate_likert(time_col = syear),
+    neighbourhood_feel_safe = neighbourhood_feel_safe %>%
+      interpolate_likert(time_col = syear)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and job of the person
+  group_by(pid, job_nr_individual) %>%
+  mutate(
+    income_satisfied_individual = income_satisfied_individual %>%
+      interpolate_likert(time_col = syear),
+    job_satisfaction = job_satisfaction %>%
+      interpolate_likert(time_col = syear)
+  ) %>%
+  ungroup() %>%
+  # grouped by person and household jobs
+  group_by(pid, job_nr_household) %>%
+  mutate(income_satisfied_household = income_satisfied_household %>%
+    interpolate_likert(time_col = syear)) %>%
+  ungroup()
+
+print_missingness_reduction(continuous_df, unidirectional_df)
+```
+
+## non-numeric, major jumps unlikely
+
+### procedure: fill if surrounding values are identical
+
+these variables measure behaviour and attitudes. these variables tend have high inertia and progress slowly, if at all.
+
+### variables
+
++---------------+-------------------+
+| Dependent on  | Variables         |
++===============+===================+
+| pid           | friends_frequency |
++---------------+-------------------+
+| pid + house   |                   |
++---------------+-------------------+
+| pid + job     | overtime_ever\    |
+|               | work_nights       |
++---------------+-------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill ordinal
+
+# apply procedure:
+ordinal_df <- likert_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  fill_if_constant(friends_frequency) %>%
+  ungroup() %>%
+  # grouped by person and job of the person
+  group_by(pid, job_nr_individual) %>%
+  fill_if_constant(overtime_ever, work_nights) %>%
+  ungroup()
+
+print_missingness_reduction(ordinal_df, likert_df)
+```
+
+## non-numeric, major jumps unlikely, cyclical measure
+
+### procedure: copy to off-cycle years, then fill if identical
+
+cyclical measure means its reasonable to use last cycle-year value. these variables measure behaviours and attitudes. these variables tend have high inertia and progress slowly, if at all.
+
+### variables
+
++---------------+--------------------+
+| Dependent on  | Variables          |
++===============+====================+
+| pid           | sports_frequency\  |
+|               | smoker\            |
+|               | alcohol_frequency\ |
+|               | sleep_disorder     |
++---------------+--------------------+
+| pid + house   |                    |
++---------------+--------------------+
+| pid + job     |                    |
++---------------+--------------------+
+
+### apply procedure
+
+```{r}
+#| label: fill biannually measured
+
+# apply procedure:
+biannual_df <- ordinal_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  fill_n(sports_frequency, smoker, sleep_disorder, .n = 1, .time = "syear") %>%
+  fill_n(alcohol_frequency, .n = 3, .time = "syear") %>%
+  fill_if_constant(sports_frequency, smoker, sleep_disorder, alcohol_frequency) %>%
+  ungroup()
+
+print_missingness_reduction(biannual_df, ordinal_df)
+```
+
+## constructed variables
+
+### procedure:
+
+recalculate with same formulas as in 01_merging-datasets
+
+### variables
+
++--------------+-------------+
+| Dependent on | Variables   |
++==============+=============+
+| pid          | bmi\        |
+|              | obese       |
++--------------+-------------+
+| pid + house  |             |
++--------------+-------------+
+| pid + job    |             |
++--------------+-------------+
+
+### apply procedure
+
+```{r}
+#| label: fill constructed
+
+# apply procedure:
+constructed_df <- biannual_df %>%
+  arrange(pid, syear) %>%
+  # grouped by person
+  group_by(pid) %>%
+  mutate(
+    bmi = (weight_kg) / (height_m^2),
+    obese = bmi >= 30,
+  ) %>%
+  ungroup()
+
+print_missingness_reduction(constructed_df, biannual_df)
+```
+
+## interdependent variables
+
+### procedure:
+
+for groups with structural missingness, establish logical fill. If value cannot be constructed from other variables, establish dummy for models to recognize as interaction effect.
+
+### variables
+
++-----------------------------+------------------------------------+
+| Dependent on                | Variables                          |
++=============================+====================================+
+| pid                         |                                    |
++-----------------------------+------------------------------------+
+| pid + house                 |                                    |
++-----------------------------+------------------------------------+
+| pid + job                   |                                    |
++-----------------------------+------------------------------------+
+| pid + occupation            | job_satisfaction\                  |
+|                             | overtime_ever\                     |
+|                             | overtime_hours_month               |
++-----------------------------+------------------------------------+
+
+### job_satisfaction
+
+```{r}
+#| label: job_satisfaction missingness visualization
+#| fig-width: 10
+#| fig-height: 10
+
+{
+  occupation_position_table <- table(constructed_df$occupation_position, useNA = "always")
+  occupation_position_vector <- paste(
+    names(occupation_position_table),
+    " (n = ",
+    as.vector(occupation_position_table),
+    ")",
+    sep = ""
+  )
+  names(occupation_position_vector) <- names(occupation_position_table)
+  rm(occupation_position_table)
+}
+
+constructed_df %>%
+  count(occupation_position, job_satisfaction) %>%
+  group_by(occupation_position) %>%
+  mutate(n = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    isna = ifelse(is.na(job_satisfaction), TRUE, FALSE),
+    label = if_else(isna, n * 100, NA) %>% round(digits = 2),
+    label = if_else(isna, paste(label, "%", sep = ""), NA),
+    label_y = if_else(isna, if_else(n > 0.5, n - 0.075, n + 0.075), NA)
+  ) %>%
+  ggplot(aes(
+    x = factor(job_satisfaction),
+    y = n,
+    fill = !isna,
+    label = label
+  )) +
+  facet_wrap(~occupation_position,
+    labeller = labeller(occupation_position = occupation_position_vector),
+    scales = "free_x"
+  ) +
+  geom_col() +
+  geom_label(fill = "white", mapping = aes(y = label_y), hjust = 1, size = 3) +
+  theme_minimal() +
+  fill_qualitative() +
+  guides(fill = "none") +
+  guides(color = "none") +
+  labs(
+    x = "Job Satisfaction",
+    y = "Percent of Respondents",
+    title = "Job Satisfaction per Occupation Position",
+    subtitle = "Highlighting Missingness",
+    caption = ""
+  ) -
+  partial(export_return, filename = "02_job-satisfaction-na_occupation", width = 10, height = 10)
+```
+
+Missingness is concentrated to certain groups, including pensioners, unemployed people, people pursuing higher education and people doing community service. These groups do not have traditional jobs, meaning a job_satisfaction value is not meaningful for them. Thus, I introduce a missingness indicator for these groups and fill with a dummy value (-1) to ensure they are kept in the dataset without enabling biases. I do not change any existing values, and instead assume that some pensioners still do minijobs or similar.
+
+### overtime_ever
+
+```{r}
+#| label: overtime_ever vs overtime_hours_month
+
+constructed_df %>%
+  count(overtime_ever, overtime_hours_month) %>%
+  mutate(hours = factor(
+    if_else(overtime_hours_month == 0, "0", ">0"),
+    levels = c("0", ">0")
+  )) %>%
+  group_by(overtime_ever, hours) %>%
+  summarize(n = sum(n), .groups = "drop") %>%
+  group_by(overtime_ever) %>%
+  mutate(n = n / sum(n) * 100) %>%
+  ungroup() %>%
+  ggplot(aes(x = hours, y = n, fill = hours)) +
+  facet_wrap(~overtime_ever) +
+  geom_col() +
+  theme_minimal() +
+  fill_qualitative() +
+  guides(fill = "none") +
+  guides(color = "none") +
+  labs(
+    x = "Overtime hours last month",
+    y = "Percent of Respondents in Group",
+    title = "Overtime last month by self-reported 'have you ever worked overtime'",
+    subtitle = "Grouped by '0 hours last month' or 'more than 0 hours last month'"
+  ) -
+  partial(export_return,
+    filename = "02_overtime-month-na_occupation",
+    width = 10,
+    height = 10
+  )
+```
+
+As expected, people who reported to have never worked overtime also responded that they have not worked overtime in the last month. Notably, a group with recorded and/or imputed hours of overtime but no response to overtime_ever exists, meaning these values can be filled. Additionally, a similar picture to above emerges:
+
+```{r}
+#| label: overtime_ever by group
+#| fig-width: 10
+#| fig-height: 10
+
+constructed_df %>%
+  count(occupation_position, overtime_ever) %>%
+  group_by(occupation_position) %>%
+  mutate(n = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    isna = ifelse(is.na(overtime_ever), TRUE, FALSE),
+    label = if_else(isna, n * 100, NA) %>% round(digits = 2),
+    label = if_else(isna, paste(label, "%", sep = ""), NA)
+  ) %>%
+  ggplot(aes(
+    x = factor(overtime_ever),
+    y = n,
+    fill = !isna,
+    label = label
+  )) +
+  facet_wrap(~occupation_position,
+    labeller = labeller(occupation_position = occupation_position_vector),
+    scales = "free_x"
+  ) +
+  geom_col() +
+  geom_label(fill = "white", size = 3) +
+  theme_minimal() +
+  fill_qualitative() +
+  guides(fill = "none") +
+  guides(color = "none") +
+  labs(
+    x = "Overtime",
+    y = "Percent of Respondents",
+    title = "Overtime per Occupation Position",
+    subtitle = "Highlighting Missingness",
+    caption = ""
+  ) -
+  partial(export_return, filename = "02_overtime-ever-na_occupation", width = 10, height = 10)
+```
+
+Same situation as before: The concept of overtime is not meaningful for groups that are not in traditional employment, including self- and un-employed people, people pursuing education and pensioners. Thus, in addition to "if overtime_ever is NA but overtime_hours is not, impute", the procedure outlined for job_satisfaction will also be applied for the relevant groups.
+
+### apply procedure
+
+```{r}
+#| label: fill interdependent
+
+# apply procedure:
+interdependent_df <- constructed_df %>%
+  arrange(pid, syear) %>%
+  # impute overtime_ever based on overtime_hours_month:
+  # only edit if a) overtime-ever is NA, b) overtime_hours_month is not na, then do ifelse based on overtime_hours_month > 0
+  mutate(overtime_ever = if_else(
+    is.na(overtime_ever),
+    if_else(
+      !is.na(overtime_hours_month),
+      if_else(overtime_hours_month > 0, TRUE, FALSE),
+      overtime_ever
+    ),
+    overtime_ever
+  )) %>%
+  # apply group-based filling for job_satisfaction, overtime_ever and overtime_hours_month
+  group_by(pid) %>%
+  mutate(
+    job_satisfaction = if_else(
+      is.na(job_satisfaction) &
+        occupation_position %in% c(
+          "education/training",
+          "not employed",
+          "retired",
+          "military/community service"
+        ),
+      -1,
+      job_satisfaction
+    ),
+    overtime_ever = if_else(
+      is.na(overtime_ever) &
+        occupation_position %in% c(
+          "education/training",
+          "self-employed",
+          "not employed",
+          "retired",
+          "military/community service"
+        ),
+      -1,
+      overtime_ever
+    ),
+    overtime_hours_month = if_else(
+      is.na(overtime_hours_month) &
+        occupation_position %in% c(
+          "education/training",
+          "self-employed",
+          "not employed",
+          "retired",
+          "military/community service"
+        ),
+      -1,
+      overtime_hours_month
+    )
+  ) %>%
+  # add indicators
+  mutate(
+    job_satisfaction_meaningful = if_else(job_satisfaction == -1, FALSE, TRUE),
+    overtime_meaningful = if_else(overtime_ever == -1, FALSE, TRUE)
+  ) %>%
+  ungroup()
+
+print_missingness_reduction(interdependent_df, constructed_df, strict_column_match = FALSE)
+```
+
+# drop impute-only years
+
+2011 and 2012 were only kept to act as impute data for 2013 and onwards, thus dropped now. technically, 2023 could be dropped here, as we have no depression data from future years. kept for potential sanity checks
+
+```{r}
+#| label: drop impute-only years
+
+reconstructed_df <- interdependent_df %>%
+  filter(syear >= 2013)
+```
+
+# overall comparison
+
+```{r}
+#| label: report complete missingness reduction
+
+missingness_reduction(reconstructed_df,
+  sparse_df %>% filter(syear >= 2013),
+  strict_column_match = FALSE
+) %>%
+  export_return("02_na-reduction_reconstruction_full",
+    caption = "Reduction of Missingness per variable after deterministic reconstruction for all years included in the reconstruction process.",
+    label = "na-reduction_reconstruction_full",
+    tabular.environment = "longtable",
+    align = c("p{5cm}", "r", "r", "r", "r", "r"),
+    digits = c(0, 0, 2, 2, 2, 0, 0),
+    break.chars = c("_")
+  ) %>%
+  datatable(options = list(paging = FALSE, info = FALSE, dom = "t"))
+```
+
+```{r}
+#| label: report analysis missingness reduction
+
+missingness_reduction(
+  reconstructed_df %>% filter(!is.na(depression_phq4_score_in_1y)),
+  sparse_df %>% filter(syear >= 2013) %>% filter(!is.na(depression_phq4_score_in_1y)),
+  strict_column_match = FALSE
+) %>%
+  export_return(
+    "02_na-reduction_reconstruction_analysis",
+    caption = "Reduction of Missingness per variable after deterministic reconstruction for pid-year combinations with a 'depression in 1y' observation.",
+    label = "na-reduction_reconstruction_analysis",
+    tabular.environment = "longtable",
+    align = c("p{5cm}", "r", "r", "r", "r", "r"),
+    digits = c(0, 0, 2, 2, 2, 0, 0),
+    break.chars = c("_")
+  ) %>%
+  datatable(options = list(paging = FALSE, info = FALSE, dom = "t"))
+```
+
+The 2 variables missing compared to the full table are "job_nr_individual" and "housing_east_west". Reason is that within the "only include those rows with value in depression_in_1y" filter these variables are already at 0% missingness in sparse df.
+
+```{r}
+#| label: heatmap after reconstruction
+#| fig-width: 10
+#| fig-height: 9
+
+reconstructed_df %>%
+  select(syear, depression_phq4_binary_in_1y, age:last_col()) %>%
+  na_heatmap_variables(bold_variables = c("belief_little_control_life", "character_optimism")) -
+  partial(export_return, filename = "02_na-heatmap-variables_reconstructed", width = 10, height = 9)
+```
+
+# export
+
+```{r}
+#| label: export file
+
+save_reconstructed_df(reconstructed_df)
+```
+
+````{=html}
+<!--
+
+## template
+
+### procedure:
+
+### variables
+
++--------------+-------------+
+| Dependent on | Variables   |
++==============+=============+
+| pid          |             |
++--------------+-------------+
+| pid + house  |             |
++--------------+-------------+
+| pid + job    |             |
++--------------+-------------+
+
+### apply procedure
+
+```{r}
+#| label: fill example
+
+# # apply procedure:
+# name_df <- previous_df %>%
+#   arrange(pid, syear) %>%
+#   # grouped by person
+#   group_by(pid) %>%
+#   ungroup() %>%
+#   # grouped by person and dwelling
+#   group_by(pid, housing_moved_in_year) %>%
+#   ungroup() %>%
+#   # grouped by person and job of the person
+#   group_by(pid, job_nr_individual) %>%
+#   ungroup() %>%
+#   # grouped by person and household jobs
+#   group_by(pid, job_nr_household) %>%
+#   ungroup()
+#
+# print_missingness_reduction(name_df, previous_df)
+```
+
+-->
+````

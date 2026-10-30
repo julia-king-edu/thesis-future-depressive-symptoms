@@ -1,0 +1,115 @@
+---
+title: "Obtain Predictions"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Prepare Environment
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+```{r}
+#| label: load best model config
+
+selected_config <- load_selected_config(threshold = TRUE)
+```
+
+# Train Set Resamples
+
+## Load Resources
+
+```{r}
+#| label: load model based on resamples
+
+resample_fit <- load_model("resample")
+```
+
+## Obtain Predictions
+
+```{r}
+#| label: get train predictions
+
+resample_preds <- resample_fit %>%
+  augment() %>%
+  mutate(.row = row_number()) %>%
+  # get fold ids back
+  inner_join(
+    resample_fit %>%
+      collect_predictions() %>%
+      select(.row, fold_id = id),
+    by = join_by(.row)
+  ) %>%
+  select(-.row) %>%
+  mutate(.pred_class = factor(
+    if_else(.pred_TRUE >= selected_config[["threshold"]], TRUE, FALSE),
+    levels = c(TRUE, FALSE)
+  ))
+```
+
+
+
+# Test Set
+
+## Load resources
+
+```{r}
+#| label: load best imputation technique and final fitted model
+
+selected_imp <- load_recipe(selected_config[["imp"]])
+final_fit <- load_model("full")
+```
+
+```{r}
+#| label: load test df
+
+test_df <- load_split_df("test")
+```
+
+## Preprocess test data
+
+When splitting the dataset, i used the version that still includes NA's for depression, as those were still used to train the imputation techniques. Thus i need to reduce the test df first before using it to evaluate.
+
+```{r}
+#| label: reduce test df
+
+test_df <- test_df %>%
+  filter_relevant()
+```
+
+```{r}
+#| label: impute test df
+
+test_imp <- bake(selected_imp, test_df)
+```
+
+## Obtain Predictions
+
+```{r}
+#| label: get test predictions
+
+test_preds <- final_fit %>%
+  augment(test_imp) %>%
+  mutate(.pred_class = factor(if_else(.pred_TRUE >= selected_config[["threshold"]], TRUE, FALSE), levels = c(TRUE, FALSE)))
+```
+
+# Export
+
+```{r}
+#| label: export predictions
+
+save_predicted_df(resample_preds, type = "resample")
+save_predicted_df(test_preds, type = "test")
+```

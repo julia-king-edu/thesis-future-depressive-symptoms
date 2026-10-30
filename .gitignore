@@ -1,0 +1,67 @@
+# data
+data/*/*
+!data/*/.gitkeep
+
+# models
+models/*/*
+!models/*/.gitkeep
+
+# quarto build artefacts
+site_libs/
+analysis/*/
+!analysis/build/
+
+analysis/build/.cache/
+!analysis/build/.cache/
+analysis/build/.cache/*
+!analysis/build/.cache/.gitkeep
+
+# latex build folder
+documents/manuscript/build/*
+!documents/manuscript/build/.gitkeep
+# latex bib file (autoexported by zotero, different per computer)
+documents/manuscript/bib/citations.bib
+
+# renv
+renv.lock
+renv/*
+
+# LaTeX
+*.aux
+*.log
+*.toc
+*.out
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.nav
+*.snm
+*.bbl
+*.blg
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+.Renviron
+renv/library/
+.Rapp.history
+
+# VS Code
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.bak
+*.swp
+
+/.quarto/
+**/*.quarto_ipynb
+_site/*
+.positai

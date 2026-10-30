@@ -1,0 +1,217 @@
+---
+title: "Missingness - Stochastic Imputation"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load packages & set variables
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+# Load Dataset
+
+```{r}
+#| label: load dataframe
+
+reconstructed_df <- load_reconstructed_df()
+```
+
+# Split and save
+
+```{r}
+#| label: train test split
+set.seed(94)
+
+split_data <- group_initial_split(data = reconstructed_df, prop = 0.8, group = "pid")
+train_df <- training(split_data)
+test_df <- testing(split_data)
+```
+
+```{r}
+#| label: save to folder
+
+save_split_df(train_df, "train")
+save_split_df(test_df, "test")
+```
+
+# Diagnostics
+
+```{r}
+#| label: load again
+
+train_df <- load_split_df("train")
+test_df <- load_split_df("test")
+```
+
+```{r}
+#| label: print sizes
+
+n_train <- nrow(train_df)
+n_test <- nrow(test_df)
+n_train_filtered <- nrow(train_df %>% filter_relevant())
+n_test_filtered <- nrow(test_df %>% filter_relevant())
+print("Unfiltered")
+print(paste0("train: ", n_train, ", test: ", n_test, " (", n_train / (n_train + n_test) * 100, "%)"))
+print("Filtered")
+print(paste0("train: ", n_train_filtered, ", test: ", n_test_filtered, " (", n_train_filtered / (n_train_filtered + n_test_filtered) * 100, "%)"))
+```
+
+```{r}
+#| label: give train vs test depression
+#| fig-width: 10
+#| fig-height: 10
+
+# combine dfs with indicator
+train_df %>%
+  mutate(group = "Training") %>%
+  bind_rows(test_df %>%
+    mutate(group = "Test")) %>%
+  mutate(group = fct_infreq(group)) %>%
+  # only keep relevant cases
+  drop_na(depression_phq4_binary_in_1y) %>%
+  # count & prepare
+  count(group,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  group_by(group) %>%
+  mutate(
+    prevalence = n / sum(n),
+    prevalence = scales::percent(prevalence, accuracy = 0.01)
+  ) %>%
+  ungroup() %>%
+  filter(depression_phq4_binary_in_1y) %>%
+  select("Set" = group, "% above cutoff" = prevalence) %>%
+  export_return(
+    "03_depression_prevalence_split",
+    caption = "Reports the percentage of individuals displaying depressive symptoms above the PHQ-2 threshold in the training and testing sets.",
+    label = "depression_prevalence_split",
+    tabular.environment = "tabular",
+    align = c("l", "r")
+  )
+```
+
+```{r}
+#| label: visualize train vs test prevalence of depression
+#| fig-width: 5
+#| fig-height: 4
+
+# combine dfs with indicator
+train_df %>%
+  mutate(group = "Training Set") %>%
+  bind_rows(test_df %>%
+    mutate(group = "Test Set")) %>%
+  mutate(group = fct_infreq(group)) %>%
+  # only keep relevant cases
+  drop_na(depression_phq4_binary_in_1y) %>%
+  mutate(depression_phq4_binary_in_1y = factor(
+    depression_phq4_binary_in_1y,
+    levels = c(FALSE, TRUE),
+    labels = c("Below", "Above")
+  )) %>%
+  # count & prepare
+  count(group,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  group_by(group) %>%
+  mutate(n = n / sum(n)) %>%
+  # plot
+  ggplot(aes(x = depression_phq4_binary_in_1y, y = n, fill = depression_phq4_binary_in_1y)) +
+  facet_wrap(~group) +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(n, accuracy = 0.1)),
+    vjust = 1.2,
+    size = 4,
+    fill = "white"
+  ) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  theme_minimal() +
+  theme(legend.position = "top", legend.direction = "horizontal") +
+  scale_fill_manual(
+    values = c("Above" = palette_qualitative[1], "Below" = palette_qualitative[2])
+  ) +
+  guides(fill = "none") +
+  labs(
+    x = "PHQ-2 Cutoff Status",
+    y = "Proportion",
+    fill = "",
+    title = "Prevalence of elevated PHQ-2 Scores per Split",
+    subtitle = "Cutoff for clinically relevant PHQ-2 Scores: ≥3"
+  ) -
+  partial(export_return,
+    filename = "03_symptom_prevalence_per_split",
+    width = 5,
+    height = 4
+  )
+```
+
+```{r}
+#| label: visualize train vs test distribution of depression
+#| fig-width: 10
+#| fig-height: 10
+
+# combine dfs with indicator
+train_df %>%
+  mutate(group = "Training Set") %>%
+  bind_rows(test_df %>%
+    mutate(group = "Test Set")) %>%
+  mutate(group = fct_infreq(group)) %>%
+  # only keep relevant cases
+  drop_na(depression_phq4_score_in_1y, depression_phq4_binary_in_1y) %>%
+  # count & prepare
+  count(group,
+    depression_phq4_score_in_1y,
+    depression_phq4_binary_in_1y,
+    wt = weight
+  ) %>%
+  group_by(group) %>%
+  mutate(n = n / sum(n)) %>%
+  # plot
+  ggplot(aes(x = depression_phq4_score_in_1y, y = n, fill = depression_phq4_binary_in_1y)) +
+  facet_wrap(~group) +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(n, accuracy = 0.1)),
+    vjust = 1.1,
+    size = 3.5,
+    fill = "white"
+  ) +
+  scale_x_continuous(breaks = seq(0, 6, 1)) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.075))) +
+  theme_minimal() +
+  theme(legend.position = "top", legend.direction = "horizontal") +
+  scale_fill_manual(
+    values = c("TRUE" = palette_qualitative[1], "FALSE" = palette_qualitative[2]),
+    labels = c("FALSE" = "Below Cutoff", "TRUE" = "Above Cutoff")
+  ) +
+  # guides(fill = "none") +
+  labs(
+    x = "Symptom Score",
+    y = "Proportion",
+    fill = "",
+    title = "Distribution of PHQ-2 Symptom Scores per Split",
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "03_symptom_score_per_split",
+    width = 10,
+    height = 10
+  )
+```

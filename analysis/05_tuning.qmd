@@ -1,0 +1,537 @@
+---
+title: "Modelling"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load packages & set variables
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(themis)
+library(lme4)
+library(ranger)
+library(xgboost)
+library(discrim)
+library(finetune)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+# Load Dataset
+
+```{r}
+#| label: load dataframes and variable roles
+
+train_avg <- load_imputed_df("avg")
+train_model <- load_imputed_df("model")
+train_bag <- load_imputed_df("bag")
+
+train_all <- list(
+  "avg" = train_avg,
+  "model" = train_model,
+  "bag" = train_bag
+)
+
+roles_df <- load_roles_df()
+
+outcome_var <- roles_df %>%
+  filter(role == "outcome") %>%
+  pull(variable)
+```
+
+```{r}
+#| label: remove perceptions
+
+train_all_no_p <- map(train_all, . %>%
+  select(-starts_with(
+    c(
+      "income_satisfied_",
+      "sleep_quality",
+      "feels_",
+      "eval_self_positive",
+      "life_satisfaction",
+      "job_satisfaction",
+      "health_satisfaction",
+      "stress_deal_well",
+      "character_",
+      "belief_",
+      "neighbourhood_eval_good",
+      "neighbourhood_cohesion",
+      "neighbourhood_feel_safe",
+      "neighbourhood_greenspace_insufficient"
+    )
+  )))
+
+roles_df_no_p <- roles_df %>% filter(variable %in% colnames(train_all[[1]]))
+```
+
+# Recipe
+
+```{r}
+#| label: recipes
+
+build_recipes <- function(data, roles_df = NULL, smote = FALSE) {
+  #' Build Recipes for Workflow
+  #'
+  #' All Workflows need analogous recipes. Set with this function
+  #'
+  #' @param data : data resamples were drawn from
+  #' @param roles_df : df containing roles in original df.
+  #' defaults to NULL, uses freshly loaded one in that case
+  #' @param smote : logical, whether to apply smote for class balance
+  #'
+  #' @return recipe
+
+  if (is.null(data)) {
+    return(NULL)
+  }
+
+  # load df if not provided
+  if (is.null(roles_df)) {
+    roles_df <- load_roles_df()
+  }
+
+  # reduce data to formula cols
+  data <- data %>%
+    select_formula_cols(roles_df = roles_df)
+
+  # get names of cols
+  predictor_cols <- roles_df %>%
+    filter(role == "predictor") %>%
+    pull(variable)
+
+  outcome_col <- roles_df %>%
+    filter(role == "outcome") %>%
+    pull(variable)
+
+  weight_col <- roles_df %>%
+    filter(role == "case_weights") %>%
+    pull(variable)
+
+  # build base
+  r_base <- recipe(
+    x = data,
+    formula = as.formula(paste(outcome_var, "~ ."))
+  )
+
+  # add smote
+  if (smote) {
+    r_base <- r_base %>%
+      step_smote(all_outcomes(), skip = TRUE)
+  }
+
+  # gb and glmnet require dummies
+  r_dummy <- r_base %>%
+    step_dummy(all_factor_predictors())
+
+  # zero variance removal for all models
+  r_base <- r_base %>%
+    step_zv(all_predictors())
+
+  r_dummy <- r_dummy %>%
+    step_zv(all_predictors())
+
+  r_complete <- list(
+    "elnet" = r_dummy,
+    "rf" = r_base,
+    "gb" = r_dummy
+  )
+
+  return(r_complete)
+}
+
+recipes_all_base <- map(train_all, build_recipes)
+recipes_all_smote <- map(train_all, ~ build_recipes(., smote = TRUE))
+```
+
+
+# Prepare Crossvalidation
+
+If i dont need to use upsampling, i can rely on vfold validation.
+
+If i want to use upsampling, need to make my own cv draw function, as i need to both a) respect sampling weights (which i can do here by doing weighted sampling) and b) smote later, which assumes equal sampling weights.
+
+```{r}
+#| label: weighted mc cv function
+
+# seed is set internally in the weighted_mc_cv function.
+mc_all <- map(train_all, ~ weighted_mc_cv(.,
+  weight_col = "weight",
+  times = 5,
+  train_prop = 0.8,
+  compress_weight = FALSE
+))
+```
+
+```{r}
+#| label: vfold function
+
+# seed is set internally in the split_vfold wrapper function.
+vfold_all <- map(train_all, ~ split_vfold(., strata = outcome_var))
+```
+
+# Select variation
+
+```{r}
+#| label: select variation of cv and recipe
+
+recipes_all <- recipes_all_base
+cv_all <- vfold_all
+```
+
+# Define Model workflow
+
+models to implement:
+1. elastic net logistic regression
+  -> hyperparams are penalty and mixture
+2. random forest
+  -> important hyperparams are mtry and min_n
+3. gradient boosting
+  -> 8 params, most important are probs tree_depth, trees
+
+```{r}
+#| label: model specifications
+
+# elnet
+spec_elnet <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# rf
+spec_rf <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>%
+  set_engine("ranger",
+    num.threads = 1,
+    probability = TRUE,
+    importance = "permutation"
+  ) %>%
+  set_mode("classification")
+
+# gb
+spec_gb <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>%
+  set_engine("xgboost", nthread = 1) %>%
+  set_mode("classification")
+
+spec_all <- list(
+  "elnet" = spec_elnet,
+  "rf" = spec_rf,
+  "gb" = spec_gb
+)
+```
+
+```{r}
+#| label: set parameter ranges
+
+params_all <- imap(recipes_all, \(recipes_imp, imp) {
+  imp <- list(
+    elnet = spec_elnet %>%
+      extract_parameter_set_dials() %>%
+      update(
+        penalty = penalty(range = c(-10, 0)), # default range
+        mixture = mixture(range = c(0, 1)) # default is 0.05 - 1, but i want to include pure ridge model too.
+      ),
+    rf = spec_rf %>%
+      extract_parameter_set_dials() %>%
+      update( # leaving mtry as default, as thats already dynamic to var count
+        min_n = min_n(range = c(2, 50)) # slightly increased upper limit, to see if smooth trees help maybe
+      ) %>%
+      finalize(recipes_imp$rf$template), # sets mtry max to nrow of predictor template df
+    gb = spec_gb %>%
+      extract_parameter_set_dials() %>%
+      update(
+        trees = trees(range = c(100, 2000)), # default
+        tree_depth = tree_depth(range = c(1, 10)), # reduced max from 15 to 10 to avoid overfitting
+        learn_rate = learn_rate(range = c(-3, -0.5)), # default
+        min_n = min_n(range = c(2, 50)), # increased max, see rf, using same range for comparison
+        loss_reduction = loss_reduction(range = c(-5, 1)), # significantly increased lower limit to avoid massive trees
+        sample_size = sample_prop(range = c(0.5, 1)) # default
+      )
+  )
+})
+```
+
+```{r}
+#| label: initial grid sizes
+
+init_grid_all <- imap(params_all, \(params_imp, imp) {
+  imp <- imap(params_imp, \(params_model, model) {
+    model <- length(params_model$object) + 2
+  })
+})
+```
+
+```{r}
+#| label: set maximization metrics
+
+tune_metrics <- metric_set(
+  average_precision,
+  pr_auc,
+  roc_auc,
+  brier_class,
+  mn_log_loss
+)
+```
+
+```{r}
+#| label: build workflow sets
+
+tune_wf_set <- function(models,
+                        recipes,
+                        resamples,
+                        params,
+                        metrics,
+                        initial,
+                        iter = 40,
+                        save_workflow = FALSE,
+                        save_pred = FALSE,
+                        time_limit = 180,
+                        seed = 94) {
+  #' Build Workflow Set
+  #'
+  #' function description
+  #'
+  #' @param models : models list, should be same for comparison
+  #' @param recipes : named recipes list
+  #' @param resamples : corresponding resample
+  #' @param params : named list of parameter ranges with the elements coming from extract_parameter_set_dials %>% update
+  #' @param metrics : metrics used at end. first metric is the one optimized for.
+  #' @param initial : named list of initial grid sizes
+  #' @param iter : max nr of iterations of tune_bayes (initial grid not included). defaults to 40.
+  #' @param save_pred : logical whether to save predictions from all tuning attempts. defaults to FALSE.
+  #' @param seed : rng seed, defaults to 94
+  #'
+  #' @return workflow_set object
+
+
+  wf_set <- workflow_set(
+    preproc = recipes,
+    models = models,
+    cross = FALSE,
+    case_weights = weight
+  )
+
+
+  # add parameters & initial grid size per model
+  for (model_name in names(params)) {
+    wf_id <- paste0(model_name, "_", model_name)
+
+    wf_set <- wf_set %>%
+      option_add(
+        param_info = params[[model_name]],
+        initial = initial[[model_name]],
+        id = wf_id
+      )
+  }
+
+  set.seed(seed)
+  tuned <- wf_set %>%
+    workflow_map(
+      fn = "tune_bayes",
+      resamples = resamples,
+      metrics = metrics,
+      iter = iter,
+      control = control_bayes(
+        verbose_iter = TRUE,
+        save_workflow = save_workflow,
+        save_pred = save_pred,
+        parallel_over = "resamples",
+        time_limit = time_limit
+      ),
+      # parallelization hopefully helps
+      verbose = TRUE
+    )
+
+  return(tuned)
+}
+```
+
+# tester
+
+```{r}
+#| label: test
+
+model_id <- "elnet" # elnet, rf, gb
+data_id <- "avg" # avg, model, bag
+
+{
+  # enable parallelization
+  workers <- min(
+    parallelly::availableCores() - 1,
+    max(
+      nrow(cv_all[["avg"]]) + 1, # nr of folds
+      max(unlist(init_grid_all[["avg"]])) + 1 # size of initial grid
+    )
+  ) # cores - 1, or max needed by folds & initial grid, depending on whats lower
+  cl <- parallel::makePSOCKcluster(workers)
+  doParallel::registerDoParallel(cl)
+
+  t <- tune_wf_set(
+    models = spec_all[model_id],
+    recipes = recipes_all[[data_id]][model_id],
+    resamples = cv_all[[data_id]],
+    params = params_all[[data_id]][model_id],
+    metrics = tune_metrics,
+    initial = init_grid_all[[data_id]][model_id],
+    iter = 20,
+    save_workflow = TRUE,
+    save_pred = TRUE
+  )
+
+  # disable parallelization
+  foreach::registerDoSEQ()
+  parallel::stopCluster(cl)
+}
+
+
+t_res <- t %>%
+  extract_workflow_set_result(paste0(model_id, "_", model_id))
+
+t_params <- t_res %>%
+  select_best()
+
+t_preds <- t %>% collect_predictions(parameters = t_params)
+
+# conf_mat(truth = depression_phq4_binary_in_1y, estimate = .pred_class, data = t_preds)
+
+print(paste0(
+  "ROC-AUC: ",
+  t_preds %>%
+    roc_auc(truth = depression_phq4_binary_in_1y, .pred_TRUE),
+  ", PR-AUC: ",
+  t_preds %>%
+    pr_auc(truth = depression_phq4_binary_in_1y, .pred_TRUE)
+))
+
+t_preds %>%
+  roc_curve(truth = depression_phq4_binary_in_1y, .pred_TRUE) %>%
+  autoplot() -
+  partial(export_return, filename = paste0("05_roc-curve_", data_id, model_id), width = 5, height = 5)
+
+t_preds %>%
+  pr_curve(truth = depression_phq4_binary_in_1y, .pred_TRUE) %>%
+  autoplot() -
+  partial(export_return, filename = paste0("05_pr-curve_", data_id, model_id), width = 5, height = 5)
+```
+
+
+# Compute & export
+
+```{r}
+#| label: set time limit
+
+tune_time_limit <- 6 * 60 # specified in minutes
+```
+
+```{r}
+#| label: avg
+
+# enable parallelization
+workers <- min(
+  parallelly::availableCores() - 1,
+  max(
+    nrow(cv_all[["avg"]]) + 1, # nr of folds
+    max(unlist(init_grid_all[["avg"]])) + 1 # size of initial grid
+  )
+) # cores - 1, or max needed by folds & initial grid, depending on whats lower
+cl <- parallel::makePSOCKcluster(workers)
+doParallel::registerDoParallel(cl)
+
+wfset_avg <- tune_wf_set(
+  models = spec_all,
+  recipes = recipes_all[["avg"]],
+  resamples = cv_all[["avg"]],
+  params = params_all[["avg"]],
+  metrics = tune_metrics,
+  initial = init_grid_all[["avg"]],
+  time_limit = tune_time_limit
+)
+
+# disable parallelization
+foreach::registerDoSEQ()
+parallel::stopCluster(cl)
+
+save_wf_set(wfset_avg, "avg")
+rm(train_avg, wfset_avg)
+```
+
+```{r}
+#| label: model
+
+# enable parallelization
+workers <- min(
+  parallelly::availableCores() - 1,
+  max(
+    nrow(cv_all[["avg"]]) + 1, # nr of folds
+    max(unlist(init_grid_all[["avg"]])) + 1 # size of initial grid
+  )
+) # cores - 1, or max needed by folds & initial grid, depending on whats lower
+cl <- parallel::makePSOCKcluster(workers)
+doParallel::registerDoParallel(cl)
+
+wfset_model <- tune_wf_set(
+  models = spec_all,
+  recipes = recipes_all[["model"]],
+  resamples = cv_all[["model"]],
+  params = params_all[["model"]],
+  metrics = tune_metrics,
+  initial = init_grid_all[["model"]],
+  time_limit = tune_time_limit
+)
+
+# disable parallelization
+foreach::registerDoSEQ()
+parallel::stopCluster(cl)
+
+save_wf_set(wfset_model, "model")
+rm(train_model, wfset_model)
+```
+
+```{r}
+#| label: bag
+
+# enable parallelization
+workers <- min(
+  parallelly::availableCores() - 1,
+  max(
+    nrow(cv_all[["avg"]]) + 1, # nr of folds
+    max(unlist(init_grid_all[["avg"]])) + 1 # size of initial grid
+  )
+) # cores - 1, or max needed by folds & initial grid, depending on whats lower
+cl <- parallel::makePSOCKcluster(workers)
+doParallel::registerDoParallel(cl)
+
+wfset_bag <- tune_wf_set(
+  models = spec_all,
+  recipes = recipes_all[["bag"]],
+  resamples = cv_all[["bag"]],
+  params = params_all[["bag"]],
+  metrics = tune_metrics,
+  initial = init_grid_all[["bag"]],
+  time_limit = tune_time_limit
+)
+
+# disable parallelization
+foreach::registerDoSEQ()
+parallel::stopCluster(cl)
+
+save_wf_set(wfset_bag, "bag")
+rm(train_bag, wfset_bag)
+```

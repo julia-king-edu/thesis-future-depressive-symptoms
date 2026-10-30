@@ -1,0 +1,73 @@
+---
+title: "Final Model Fit"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Load resources
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+```{r}
+#| label: load best model config
+
+selected_config <- load_selected_config(threshold = TRUE)
+selected_wf <- load_selected_wf()
+```
+
+```{r}
+#| label: load train dataset
+
+train_df <- load_imputed_df(selected_config[["imp"]])
+```
+
+# Generate Resamples
+
+```{r}
+#| label: generate folds
+
+# using new folds compared to thresholds just to avoid biases
+fit_folds <- split_vfold(train_df, strata = "depression_phq4_binary_in_1y", v = 10, seed = 49)
+```
+
+# Fit on resamples for train metrics
+
+```{r}
+#| label: do resamples fit for best wf
+
+resample_fit <- selected_wf %>%
+  fit_resamples(fit_folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+```
+
+# Final model fit on entire training data
+
+```{r}
+#| label: do full fit for best wf
+
+final_fit <- selected_wf %>%
+  fit(data = train_df)
+```
+
+# Export
+
+```{r}
+#| label: export models
+
+save_model(resample_fit, type = "resample")
+save_model(final_fit, type = "full")
+```

@@ -1,0 +1,426 @@
+---
+title: "Threshold Selection"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Load resources
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(probably)
+library(ggrepel)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+```{r}
+#| label: load best model config
+
+selected_config <- load_selected_config(threshold = FALSE)
+selected_wf <- load_selected_wf()
+```
+
+```{r}
+#| label: load train dataset
+
+train_df <- load_imputed_df(selected_config[["imp"]])
+```
+
+# Get Predictions
+
+Done for best performing model in threshold-independent roc curve setting.
+
+```{r}
+#| label: create threshold splits
+
+th_folds <- split_vfold(train_df, strata = "depression_phq4_binary_in_1y", v = 10)
+```
+
+```{r}
+#| label: get predictions for each split
+
+th_preds <- selected_wf %>%
+  fit_resamples(th_folds, control = control_resamples(save_pred = TRUE)) %>%
+  collect_predictions()
+```
+
+```{r}
+#| label: save threshold predictions
+
+save_predicted_df(th_preds, "threshold")
+```
+
+```{r}
+#| label: load threshold predictions
+
+th_preds <- load_predicted_df("threshold")
+```
+
+# Generate Metrics
+
+```{r}
+#| label: set metrics
+
+# custom wrapper function for f2 metric, as false negative more costly than false positive
+f2_meas <- metric_tweak(
+  "f2_meas",
+  f_meas,
+  beta = 2
+)
+
+f05_meas <- metric_tweak(
+  "f05_meas",
+  f_meas,
+  beta = 0.5
+)
+
+th_metric_labels <- c(
+  # first listed is the one used for threshold picking
+  f2_meas = "F2-Score",
+  bal_accuracy = "Balanced Accuracy",
+  j_index = "Youden's J Statistic",
+  f_meas = "F1-Score",
+  f05_meas = "F0.5-Score",
+  mcc = "Matthews Correlation Coefficient",
+  accuracy = "Accuracy", # not ideal for imbalance but included for comparison, not relevant to decision.
+  precision = "Precision",
+  recall = "Recall"
+)
+
+# th_metric_set <- do.call(metric_set, map(names(th_metric_labels), get))
+```
+
+```{r}
+#| label: compute overall threshold metrics
+#| warning: false
+
+
+compute_threshold_metrics <- function(data,
+                                      truth = "depression_phq4_binary_in_1y",
+                                      estimate = ".pred_TRUE",
+                                      metrics_key,
+                                      na_rm = TRUE,
+                                      candidates = seq(0, 1, 0.001)) {
+  #' Threshold Metrics Calculator
+  #'
+  #' uses probably::threshold_perf to get performance metrics for every point in specified sequence given model predictions.
+  #' Renames Metrics to names specified in metrics_key. Removes estimator type, is known information.
+  #'
+  #' @param data : dataset containing truth and model predictions
+  #' @param truth : colname of outcome variable
+  #' @param estimate : colname of numeric col containing probabilities for 1 category of truth
+  #' @param metrics_key : list in form of list(metricsfunction = "Name of Metric")
+  #' @param na_rm : logical
+  #' @param candidates : sequence of candidate thresholds to test
+  #'
+  #' @return tibble with columns .threshold, .metric and .estimate.
+
+  metrics <- do.call(metric_set, map(names(metrics_key), get))
+
+  th_metrics_df <- suppressWarnings( # i do this so it doesnt send thousands of "oh no cant calc precision due to 0 positive" warnings.
+    threshold_perf(
+      data,
+      truth = !!sym(truth),
+      estimate = !!sym(estimate),
+      thresholds = candidates,
+      metrics = metrics,
+      na_rm = na_rm
+    )
+  ) %>%
+    mutate(.metric = factor(
+      .metric,
+      levels = names(metrics_key),
+      labels = unname(metrics_key)
+    )) %>%
+    select(-.estimator)
+}
+
+th_metrics_df <- compute_threshold_metrics(th_preds, metrics_key = th_metric_labels)
+
+th_metrics_df %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  slice(seq(1, nrow(.), floor(nrow(.) / 100 * 10))) %>% # showing 10 rows for conciseness
+  export_return("07_threshold_metric-sample",
+    caption = "Performance metrics for a selection of all candidate thresholds based on the pooled CV predictions.",
+    label = "threshold_metric-sample"
+  )
+```
+
+F1 Score and Precision are not computable at some point due to all predictions resulting in FALSE.
+
+# Find optima
+
+```{r}
+#| label: find maximization thresholds
+
+# identifies first point where max occurs
+th_optima_df <- th_metrics_df %>%
+  group_by(.metric) %>%
+  arrange(desc(.estimate), .threshold) %>%
+  slice(1) %>%
+  relocate(.metric, .threshold, .estimate)
+
+
+selected_th <- th_optima_df %>%
+  filter(.metric == th_metric_labels[[1]]) %>%
+  pull(.threshold)
+
+th_optima_df %>%
+  export_return("07_threshold_metric-maximizations", caption = "Classification thresholds that maximize given metrics based on the pooled CV predictions.", label = "threshold_metric-maximizations")
+```
+
+```{r}
+#| label: plot thresholds for all metrics
+#| fig-width: 10
+#| fig-height: 10
+
+th_metrics_df %>%
+  drop_na() %>%
+  ggplot(aes(x = .threshold, y = .estimate)) +
+  facet_wrap(~.metric, nrow = 3, scales = "free") +
+  geom_line() +
+  geom_area(fill = 1, alpha = 0.1) +
+  geom_vline(
+    data = th_optima_df,
+    aes(xintercept = .threshold),
+    linewidth = 1,
+    color = 4
+  ) +
+  geom_label_repel(
+    data = th_optima_df,
+    aes(
+      x = .threshold,
+      y = .estimate,
+      label = paste0("th = ", .threshold, ",\nest = ", round(.estimate, 3), "")
+    ),
+    size = 3,
+    box.padding = 2
+  ) +
+  theme_minimal() +
+  theme(panel.spacing = unit(2, "lines")) +
+  color_qualitative() +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Classification Threshold",
+    y = "Metric",
+    title = "Model Metrics by Threshold",
+    subtitle = "First occurence of maximum indicated with vertical line",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return, filename = "07_thresholds-metrics", width = 10, height = 10)
+```
+
+```{r}
+#| label: plot threshold for F2 only
+#| fig-width: 5
+#| fig-height: 5
+
+th_metrics_df %>%
+  drop_na() %>%
+  filter(.metric == "F2-Score") %>%
+  ggplot(aes(x = .threshold, y = .estimate)) +
+  geom_line() +
+  geom_area(fill = 1, alpha = 0.1) +
+  geom_vline(
+    data = th_optima_df %>%
+      filter(.metric == "F2-Score"),
+    aes(xintercept = .threshold),
+    linewidth = 1,
+    color = 4
+  ) +
+  geom_label_repel(
+    data = th_optima_df %>%
+      filter(.metric == "F2-Score"),
+    aes(
+      x = .threshold,
+      y = .estimate,
+      label = paste0("th = ", .threshold, ",\nest = ", round(.estimate, 3), "")
+    ),
+    size = 4,
+    box.padding = 2
+  ) +
+  theme_minimal() +
+  theme(panel.spacing = unit(2, "lines")) +
+  color_qualitative() +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Classification Threshold",
+    y = "F2-Score",
+    title = "F2-Scores by Threshold",
+    subtitle = "Maximizing threshold indicated with vertical line",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return, filename = "07_thresholds-f2", width = 5, height = 5)
+```
+
+# Sensitivity Testing - Metrics per Fold
+
+```{r}
+#| label: get maximizing metrics per fold
+
+th_folds_metrics_df <- th_preds %>%
+  group_by(id) %>%
+  group_map(~ {
+    compute_threshold_metrics(.x, metrics_key = th_metric_labels) %>%
+      bind_cols(.y, .)
+  }, .keep = TRUE) %>%
+  bind_rows()
+
+th_folds_metrics_df
+```
+
+```{r}
+#| label: summary statistics about per fold distribution
+
+th_folds_metrics_df %>%
+  # keep only maximum for each fold
+  group_by(id, .metric) %>%
+  arrange(desc(.estimate), .threshold) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # statistics per metric
+  group_by(.metric) %>%
+  summarise(
+    median = median(.threshold),
+    q1 = quantile(.threshold, 0.25),
+    q3 = quantile(.threshold, 0.75),
+    iqr = IQR(.threshold),
+    range = max(.threshold) - min(.threshold),
+    sd = sd(.threshold),
+    .groups = "drop"
+  ) %>%
+  select(
+    "Optimized Metric" = .metric,
+    "Threshold: Median" = median,
+    Q1 = q1,
+    Q3 = q3,
+    IQR = iqr,
+    Range = range
+  ) %>%
+  export_return("07_thresholds-distribution",
+    caption = "Summary statistics of the distribution of metric-maximizing thresholds across the 10 CV folds. Values shown are threshold values, not metric estimates.",
+    label = "threshold_distribution_summary",
+    tabular.environment = "tabular",
+    align = c("l", "r", "r", "r", "r", "r"),
+    vline.after = c(1)
+  )
+```
+
+```{r}
+#| label: F2 per fold distribution
+
+th_folds_metrics_df %>%
+  filter(.metric == "F2-Score") %>%
+  # keep only maximum for each fold
+  group_by(id, .metric) %>%
+  arrange(desc(.estimate), .threshold) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # statistics per metric
+  group_by(.metric) %>%
+  summarise(
+    median = median(.threshold),
+    q1 = quantile(.threshold, 0.25),
+    q3 = quantile(.threshold, 0.75),
+    iqr = IQR(.threshold),
+    range = max(.threshold) - min(.threshold),
+    sd = sd(.threshold),
+    .groups = "drop"
+  ) %>%
+  select(
+    "Optimized Metric" = .metric,
+    "Threshold: Median" = median,
+    Q1 = q1,
+    Q3 = q3,
+    IQR = iqr,
+    Range = range
+  ) %>%
+  export_return("07_thresholds-distribution_f2",
+    caption = "Summary statistics of the distribution of F2-Score-maximizing thresholds across the 10 CV folds. Values shown are threshold values, not metric estimates.",
+    label = "threshold_distribution_summary_f2",
+    tabular.environment = "tabular",
+    align = c("l", "r", "r", "r", "r", "r"),
+    vline.after = c(1),
+    table.placement = "!b"
+  )
+```
+
+```{r}
+#| label: plot distribution of fold thresholds
+#| fig-width: 10
+#| fig-height: 10
+
+
+th_folds_metrics_df %>%
+  # keep only maximum for each fold
+  group_by(id, .metric) %>%
+  arrange(desc(.estimate), .threshold) %>%
+  slice(1) %>%
+  ungroup() %>%
+  # plot results
+  ggplot(aes(x = .metric, y = .threshold)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = id), width = 0.1, height = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(
+    angle = 45,
+    vjust = 1,
+    hjust = 1
+  )) +
+  color_qualitative() +
+  scale_y_continuous(limits = c(0, 1)) +
+  guides(color = "none") +
+  labs(
+    x = "Performance Metric",
+    y = "Threshold",
+    title = "Distribution of metric-maximizing thresholds",
+    subtitle = paste0(
+      "Distribution based on ",
+      n_distinct(th_preds$id),
+      " vfold resamples"
+    ),
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return,
+    filename = "07_thresholds-sensitivity",
+    width = 10,
+    height = 10
+  )
+```
+
+# Export Threshold
+
+```{r}
+#| label: add threshold to config & export
+
+selected_config[["threshold"]] <- selected_th
+
+save_selected_config(selected_config, threshold = TRUE)
+```

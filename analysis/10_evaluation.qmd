@@ -1,0 +1,832 @@
+---
+title: "Evaluation"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Load resources
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(ggrepel)
+library(vip)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+```{r}
+#| label: load best model config
+
+selected_config <- load_selected_config(threshold = TRUE)
+```
+
+# Set Metrics
+
+```{r}
+#| label: define metric set
+
+f2_meas <- metric_tweak("f2_meas", f_meas, beta = 2)
+
+eval_metric_info <- list(
+  list(fn = "average_precision", label = "Average Precision", type = "Classification", threshold = "independent"),
+  list(fn = "roc_auc", label = "ROC-AUC", type = "Classification", threshold = "independent"),
+  list(fn = "brier_class", label = "Brier Score", type = "Probabilistic", threshold = "independent"),
+  list(fn = "mn_log_loss", label = "Mean Log Loss", type = "Probabilistic", threshold = "independent"),
+  list(fn = "f2_meas", label = "F2-Score", type = "Classification", threshold = "dependent"),
+  list(fn = "bal_accuracy", label = "Balanced Accuracy", type = "Classification", threshold = "dependent"),
+  list(fn = "f_meas", label = "F1-Score", type = "Classification", threshold = "dependent"),
+  list(fn = "mcc", label = "Matthews Correlation Coefficient", type = "Classification", threshold = "dependent"),
+  list(fn = "precision", label = "Precision", type = "Classification", threshold = "dependent"),
+  list(fn = "recall", label = "Recall", type = "Classification", threshold = "dependent"),
+  list(fn = "spec", label = "Specificity", type = "Classification", threshold = "dependent"),
+  list(fn = "accuracy", label = "Accuracy", type = "Classification", threshold = "dependent")
+) %>%
+  bind_rows() %>%
+  mutate(across(everything(), fct_inorder))
+
+eval_metric_set <- metric_set(!!!map(as.character(eval_metric_info$fn), match.fun))
+```
+
+# Train Set
+
+## load predictions
+
+```{r}
+#| label: load resample predictions
+
+resample_preds <- load_predicted_df(type = "resample")
+```
+
+## get metrics
+
+```{r}
+#| label: get overall metrics for train
+
+cv_metrics <- resample_preds %>%
+  eval_metric_set(
+    truth = depression_phq4_binary_in_1y,
+    estimate = .pred_class,
+    .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
+  select(-.estimator) %>%
+  left_join(eval_metric_info,
+    by = join_by(.metric == fn)
+  )
+
+cv_metrics %>%
+  select(-c(".metric")) %>%
+  relocate(label) %>%
+  select(
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  export_return("10_metrics_cv", caption = "Performance Metrics based on the pooled cross-validation predictions", label = "metrics_cv", align = c("l", "r"))
+```
+
+```{r}
+#| label: get metrics per train fold
+
+fold_metrics <- resample_preds %>%
+  group_by(fold_id) %>%
+  group_map(~ {
+    eval_metric_set(
+      data = .x,
+      truth = depression_phq4_binary_in_1y,
+      estimate = .pred_class,
+      .pred_TRUE,
+      case_weights = weight
+    ) %>%
+      bind_cols(.y, .)
+  }, .keep = TRUE) %>%
+  bind_rows() %>%
+  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
+  select(-.estimator) %>%
+  left_join(eval_metric_info,
+    by = join_by(.metric == fn)
+  )
+
+fold_metrics %>%
+  mutate(fold_id = str_remove(fold_id, "Fold")) %>%
+  select(-c(".metric")) %>%
+  relocate(fold_id, label) %>%
+  select(
+    Fold = fold_id,
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  pivot_wider(
+    names_from = Fold,
+    values_from = Estimate
+  ) %>%
+  rename("Folds: 01" = "01") %>%
+  export_return("10_metrics_folds", caption = "Performance Metrics within the Training Set Folds.", label = "metrics_folds", align = c("l", "r"))
+```
+
+```{r}
+#| label: produce 2 separate tables for manuscript readability
+
+fold_metrics %>%
+  mutate(fold_id = str_remove(fold_id, "Fold")) %>%
+  select(-c(".metric")) %>%
+  relocate(fold_id, label) %>%
+  select(
+    Fold = fold_id,
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  pivot_wider(
+    names_from = Fold,
+    values_from = Estimate
+  ) %>%
+  select(Metric, "01":"05") %>%
+  rename("Folds: 01" = "01") %>%
+  export_return("10_metrics_folds_1", caption = "Performance Metrics within the Training Set Folds. Folds 1-5", label = "metrics_folds_1", align = c("l", "r"))
+
+fold_metrics %>%
+  mutate(fold_id = str_remove(fold_id, "Fold")) %>%
+  select(-c(".metric")) %>%
+  relocate(fold_id, label) %>%
+  select(
+    Fold = fold_id,
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  pivot_wider(
+    names_from = Fold,
+    values_from = Estimate
+  ) %>%
+  select(Metric, "06":"10") %>%
+  rename("Folds: 06" = "06") %>%
+  export_return("10_metrics_folds_2", caption = "Performance Metrics within the Training Set Folds. Folds 6-10", label = "metrics_folds_2", align = c("l", "r"))
+```
+
+```{r}
+#| label: summary statistics about per fold distribution
+
+fold_metrics %>%
+  # statistics per metric
+  mutate(label = fct_inorder(label)) %>%
+  group_by(label) %>%
+  summarise(
+    median = median(.estimate),
+    q1 = quantile(.estimate, 0.25),
+    q3 = quantile(.estimate, 0.75),
+    iqr = IQR(.estimate),
+    range = max(.estimate) - min(.estimate),
+    sd = sd(.estimate),
+    .groups = "drop"
+  ) %>%
+  select(
+    "Optimized Metric" = label,
+    "Median" = median,
+    Q1 = q1,
+    Q3 = q3,
+    IQR = iqr,
+    Range = range
+  ) %>%
+  export_return("10_final-robustness",
+    caption = "Summary statistics of the distribution of model metrics across the 10 CV folds.",
+    label = "final_robustness_summary",
+    tabular.environment = "tabular",
+    align = c("l", "r", "r", "r", "r", "r"),
+    vline.after = c(1)
+  )
+```
+
+```{r}
+#| label: plot distribution of metrics per fold
+#| fig-width: 10
+#| fig-height: 10
+
+fold_metrics %>%
+  mutate(group = if_else(type == "Probabilistic", "Probabilistic", if_else(threshold == "independent", "Classification\n(threshold-independent)", "Classification\n(threshold-dependent)")) %>% factor(levels = c("Probabilistic", "Classification\n(threshold-independent)", "Classification\n(threshold-dependent)"))) %>%
+  ggplot(aes(x = label, y = .estimate)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = fold_id), width = 0.1, height = 0) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      vjust = 1,
+      hjust = 1
+    ),
+    panel.background = element_rect(fill = NA, color = "black")
+  ) +
+  color_qualitative() +
+  scale_y_continuous(limits = c(0, 1)) +
+  guides(color = "none") +
+  labs(
+    x = "Performance Metric",
+    y = "Estimate",
+    title = "Distribution of Performance Metrics among folds",
+    subtitle = paste0(
+      "Distribution based on ",
+      n_distinct(fold_metrics$fold_id),
+      " vfold resamples"
+    ),
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return,
+    filename = "10_metrics-sensitivity",
+    width = 10,
+    height = 10
+  )
+```
+
+# Feature Importance
+
+```{r}
+#| label: load model
+
+final_fit <- load_model("full")
+```
+
+```{r}
+#| label: get feature importance table
+
+vars_importance_df <- final_fit %>%
+  vip::vi() %>%
+  arrange(Importance) %>%
+  rename_with(tolower)
+
+domain_variables <- list(
+  "Biographic" = c(
+    "age",
+    "sex",
+    "education_level",
+    "partnership_status",
+    "migration_background",
+    "migration_age"
+  ),
+  "Income & Workplace" = c(
+    "occupation_position",
+    "unemployed",
+    "income_net_household",
+    "income_satisfied_household",
+    "job_satisfaction",
+    "job_satisfaction_meaningful",
+    "overtime_hours_month",
+    "overtime_ever",
+    "work_nights"
+  ),
+  "Physical Health" = c(
+    "health_description",
+    "health_satisfaction",
+    "chronic_illness",
+    "disability_degree",
+    "stroke_ever",
+    "bmi",
+    "sleep_quality",
+    "sleep_disorder",
+    "sleep_hours_weekly"
+  ),
+  "Mental Health" = c(
+    "stress_deal_well",
+    "eval_self_positive",
+    "belief_self_shapes_destiny",
+    "belief_little_control_life",
+    "belief_others_control_life",
+    "feels_isolated",
+    "feels_left_out",
+    "feels_lonely",
+    "character_optimism",
+    "character_irritable",
+    "character_rumination",
+    "life_satisfaction",
+    "character_worrying",
+    "character_nervous"
+  ),
+  "Social" = c(
+    "housing_status",
+    "neighbourhood_type",
+    "household_carework",
+    "housing_east_west",
+    "household_single",
+    "distance_city_centre",
+    "neighbourhood_greenspace_insufficient",
+    "neighbourhood_feel_safe",
+    "friends_frequency",
+    "neighbourhood_cohesion"
+  ),
+  "Behavioural" = c(
+    "sports_frequency",
+    "hobbies_hours_weekly",
+    "alcohol_frequency",
+    "smoker"
+  ),
+  "Ecological" = c(
+    "neighbourhood_pollution_air",
+    "neighbourhood_pollution_noise"
+  )
+)
+
+domain_names <- names(domain_variables)
+
+variable_domains <- tibble(
+  variable = unlist(domain_variables, use.names = FALSE),
+  domain = rep(names(domain_variables), lengths(domain_variables))
+)
+
+vars_importance_df <- vars_importance_df %>%
+  left_join(variable_domains, by = "variable") %>%
+  mutate(domain = factor(domain, levels = domain_names))
+```
+
+## individual variable importance
+
+```{r}
+#| label: print
+#| fig-width: 10
+#| fig-height: 10
+
+vars_importance_df %>%
+  ggplot(aes(
+    x = importance,
+    y = fct_inorder(variable),
+    color = domain
+  )) +
+  geom_point(size = 3) +
+  scale_x_continuous(
+    limits = c(0, 0.003)
+  ) +
+  theme_minimal() +
+  color_qualitative() +
+  labs(
+    x = "Feature Importance",
+    y = "Variable",
+    title = "Extracted Feature Importance of Final Model",
+    subtitle = "Sorted by Importance",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return,
+    filename = "10_feature_importance",
+    width = 10,
+    height = 10
+  )
+```
+
+```{r}
+#| label: shortened vip plot for main text
+#| fig-width: 8
+#| fig-height: 4.5
+
+n_vars_display <- 20
+
+displayed_vars <- vars_importance_df %>%
+  slice_tail(n = n_vars_display)
+
+domain_labels <- displayed_vars %>%
+  count(domain) %>%
+  right_join(
+    tibble(domain = domain_names),
+    by = "domain"
+  ) %>%
+  mutate(
+    n = replace_na(n, 0),
+    label = paste0(domain, " (", n, ")")
+  )
+
+domain_labels_vec <- setNames(
+  domain_labels$label,
+  domain_labels$domain
+)
+
+displayed_vars <- displayed_vars %>%
+  mutate(
+    domain = factor(domain, levels = domain_names)
+  )
+
+legend_vars <- tibble(
+  variable = "",
+  importance = -1,
+  domain = factor(domain_names, levels = domain_names)
+)
+
+plot_vars <- bind_rows(
+  displayed_vars,
+  legend_vars
+)
+
+plot_vars %>%
+  ggplot(aes(
+    x = importance,
+    y = fct_inorder(variable),
+    color = domain
+  )) +
+  geom_point(size = 3) +
+  scale_x_continuous(
+    limits = c(0, 0.003)
+  ) +
+  scale_y_discrete(
+    limits = displayed_vars$variable
+  ) +
+  theme_minimal() +
+  color_qualitative(
+    labels = domain_labels_vec,
+    drop = FALSE
+  ) +
+  labs(
+    x = "Feature Importance",
+    y = "Variable",
+    color = "Domain",
+    title = "Extracted Feature Importance of Final Model",
+    subtitle = paste0("Sorted by Importance, top ", n_vars_display, " only"),
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(
+    export_return,
+    filename = "10_feature_importance_short",
+    width = 8,
+    height = 4.5
+  )
+```
+
+## aggregates per domain
+
+```{r}
+#| label: feature importance by domain
+
+domain_importance_df <- vars_importance_df %>%
+  group_by(domain) %>%
+  summarise(
+    n = n(),
+    median = median(importance, na.rm = TRUE),
+    total = sum(importance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    share = total / sum(total)
+  ) %>%
+  arrange(desc(total))
+
+domain_importance_df %>%
+  mutate(share = scales::percent(share, accuracy = 0.1)) %>%
+  select(
+    Domain = domain,
+    "Number of Features" = n,
+    "Median Importance" = median,
+    "Share of Total Importance" = share
+  ) %>%
+  export_return(
+    "10_feature_importance_domains",
+    caption = "Summary of feature importance estimates by domain in the final model.",
+    label = "feature_importance_domains",
+    align = c("l", "R", "R", "R"),
+    display = c("E", "E", "f", "E", "f"),
+    digits = c(1, 1, 0, 1, 1)
+  )
+```
+
+# Test Set
+
+## load predictions
+
+```{r}
+#| label: load test predictions
+
+test_preds <- load_predicted_df(type = "test")
+```
+
+## get metrics
+
+```{r}
+#| label: compute eval metrics for test set preds
+
+test_metrics <- test_preds %>%
+  eval_metric_set(
+    truth = depression_phq4_binary_in_1y,
+    estimate = .pred_class,
+    .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
+  select(-.estimator) %>%
+  left_join(eval_metric_info, by = join_by(.metric == fn))
+
+
+test_metrics %>%
+  select(-c(".metric")) %>%
+  relocate(label) %>%
+  select(
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  export_return("10_metrics_test", caption = "Performance Metrics based on the Test set Predictions.", label = "metrics_test")
+```
+
+## plot metrics
+
+```{r}
+#| label: roc curve
+#| fig-width: 5
+#| fig-height: 5
+
+roc_selected_coords <- test_metrics %>%
+  filter(label %in% c("Recall", "Specificity")) %>%
+  mutate(label = tolower(label)) %>%
+  select(label, .estimate) %>%
+  pivot_wider(
+    names_from = label,
+    values_from = .estimate
+  )
+
+
+test_preds %>%
+  roc_curve(
+    truth = depression_phq4_binary_in_1y, .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  autoplot() +
+  geom_point(mapping = aes(x = 1 - specificity, y = recall), color = "red", data = roc_selected_coords, size = 2) +
+  geom_label(mapping = aes(x = 1 - specificity, y = recall, label = paste0("spec = ", round(specificity, 3), "\nsens = ", round(recall, 3))), data = roc_selected_coords, size = 3, hjust = -0.1, vjust = 1.1) +
+  labs(
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    title = "ROC Curve of the finalized model",
+    subtitle = "Performance at selected threshold marked in red",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return, filename = "10_roc-test", width = 5, height = 5)
+```
+
+```{r}
+#| label: pr auc curve
+#| fig-width: 5
+#| fig-height: 5
+
+pr_selected_coords <- test_metrics %>%
+  filter(label %in% c("Recall", "Precision")) %>%
+  mutate(label = tolower(label)) %>%
+  select(label, .estimate) %>%
+  pivot_wider(
+    names_from = label,
+    values_from = .estimate
+  )
+
+
+test_preds %>%
+  pr_curve(
+    truth = depression_phq4_binary_in_1y, .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  autoplot() +
+  geom_point(mapping = aes(x = recall, y = precision), color = "red", data = pr_selected_coords, size = 2) +
+  geom_label(mapping = aes(x = recall, y = precision, label = paste0("recall = ", round(recall, 3), "\nprec = ", round(precision, 3))), data = pr_selected_coords, size = 3, hjust = -0.1, vjust = -0.1) +
+  geom_hline(yintercept = p_train, linetype = "dashed") +
+  labs(
+    x = "Recall",
+    y = "Precision",
+    title = "PR-Curve of the finalized model",
+    subtitle = "Performance at selected threshold marked in red",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return, filename = "10_pr-test", width = 5, height = 5)
+```
+
+```{r}
+#| label: compare with score
+#| fig-width: 5
+#| fig-height: 5
+
+
+test_preds %>%
+  group_by(depression_phq4_score_in_1y, depression_phq4_binary_in_1y) %>%
+  summarise(
+    share = weighted.mean(as.logical(.pred_class), w = as.double(weight), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = depression_phq4_score_in_1y, y = share, fill = depression_phq4_binary_in_1y)) +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(share, accuracy = 0.1)),
+    vjust = 1.2,
+    size = 3.25,
+    fill = "white"
+  ) +
+  fill_qualitative() +
+  scale_x_continuous(breaks = 0:6) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  guides(fill = "none") +
+  guides(color = "none") +
+  labs(
+    x = "PHQ4 Depressive Score (0-6)",
+    y = "% of people with predicted depression",
+    title = "Predicted Depression Rates by Symptom Severity",
+    subtitle = "Cutoff for likely depression is 3",
+    caption = paste0(
+      "Selected Model: ",
+      selected_config[["wf"]],
+      ",\nSelected Imputation Strategy: ",
+      selected_config[["imp"]]
+    )
+  ) -
+  partial(export_return, filename = "10_score-vs-predicted", width = 5, height = 5)
+```
+
+
+# test set baseline comparison 
+
+```{r}
+#| label: compute eval metrics for test set baseline
+
+set.seed(123)
+
+p_train <- resample_preds %>%
+  summarize(p_true = weighted.mean(
+    depression_phq4_binary_in_1y == TRUE,
+    w = as.double(weight),
+    na.rm = TRUE
+  )) %>%
+  pull(p_true)
+
+set.seed(94)
+baseline_preds <- test_preds %>%
+  mutate(
+    .pred_TRUE = p_train,
+    .pred_FALSE = 1 - p_train,
+    .pred_class = factor(
+      if_else(runif(n()) <= p_train, TRUE, FALSE),
+      levels = c(TRUE, FALSE)
+    )
+  )
+
+baseline_metrics <- baseline_preds %>%
+  eval_metric_set(
+    truth = depression_phq4_binary_in_1y,
+    estimate = .pred_class,
+    .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
+  select(-.estimator) %>%
+  left_join(eval_metric_info, by = join_by(.metric == fn))
+
+
+baseline_metrics %>%
+  select(-c(".metric")) %>%
+  relocate(label) %>%
+  select(
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  export_return("10_metrics_baseline", caption = "Performance Metrics based on the Baseline model. ", label = "metrics_baseline")
+```
+
+# combined tables
+
+## train cv + test
+
+```{r}
+#| label: train cv + test
+
+test_metrics %>%
+  select(
+    label,
+    test = .estimate
+  ) %>%
+  left_join(
+    cv_metrics %>%
+      select(
+        label,
+        train = .estimate
+      ),
+    by = join_by(label)
+  ) %>%
+  mutate(
+    diff = test - train,
+    diff_rel = diff / train,
+    diff_rel = scales::percent(diff_rel)
+  ) %>%
+  select(
+    Metric = label,
+    "Estimate (Train CV)" = train,
+    "Estimate (Test Set)" = test,
+    "Difference (Absolute)" = diff,
+    "Difference (Relative)" = diff_rel
+  ) %>%
+  export_return("10_metrics_combined_cv",
+    caption = "Performance Metrics computed from the test set predictions and pooled CV predictions of the training set. Difference columns are computed using $metric_{test} - metric_{CV}$ and $\\frac{metric_{test} - metric_{CV}}{metric_{CV}}$.", label = "metrics_combined_cv",
+    align = c("l", "R", "R", "R", "R"),
+    digits = 4
+  )
+
+tex_file <- file.path(PATH_TABLE, "10_metrics_combined_cv.tex")
+
+tex <- readLines(tex_file)
+
+# Make "Matthews Correlation Coefficient" smaller
+tex <- gsub(
+  "(Matthews Correlation Coefficient)",
+  "\\\\footnotesize{\\1}",
+  tex,
+  fixed = FALSE
+)
+
+# Make title parentheses smaller
+tex <- gsub(
+  "(\\([^()]*\\))",
+  "\\\\small{\\1}",
+  tex,
+  perl = TRUE
+)
+
+# Save the file, leaving all other lines unchanged
+writeLines(tex, tex_file)
+```
+
+## baseline
+
+```{r}
+#| label: baseline metrics
+
+test_metrics %>%
+  select(
+    label,
+    test = .estimate
+  ) %>%
+  left_join(
+    baseline_metrics %>%
+      select(
+        label,
+        baseline = .estimate
+      ),
+    by = join_by(label)
+  ) %>%
+  mutate(
+    diff = test - baseline,
+    diff_rel = if_else(baseline != 0, diff / baseline, NA),
+    diff_rel = scales::percent(diff_rel)
+  ) %>%
+  select(
+    Metric = label,
+    "Estimate (Baseline)" = baseline,
+    "Estimate (Test Set)" = test,
+    "Difference (Absolute)" = diff,
+    "Difference (Relative)" = diff_rel
+  ) %>%
+  export_return("10_metrics_combined_baseline",
+    caption = "Performance Metrics computed from the test set predictions and constant baseline predictions. Difference columns are computed using $metric_{test} - metric_{baseline}$ and $\\frac{metric_{test} - metric_{baseline}}{metric_{baseline}}$.", label = "metrics_combined_baseline",
+    align = c("l", "R", "R", "R", "R"),
+    digits = 4
+  )
+
+tex_file <- file.path(PATH_TABLE, "10_metrics_combined_baseline.tex")
+
+tex <- readLines(tex_file)
+
+# Make "Matthews Correlation Coefficient" smaller
+tex <- gsub(
+  "(Matthews Correlation Coefficient)",
+  "\\\\small{\\1}",
+  tex,
+  fixed = FALSE
+)
+
+# Make title parentheses smaller
+tex <- gsub(
+  "(\\([^()]*\\))",
+  "\\\\small{\\1}",
+  tex,
+  perl = TRUE
+)
+
+# Save the file, leaving all other lines unchanged
+writeLines(tex, tex_file)
+```

@@ -1,0 +1,824 @@
+---
+title: "Missingness - Stochastic Imputation"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load packages & set variables
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(lmtest)
+library(tidymodels)
+library(corrr)
+library(patchwork)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+# Load Dataset
+
+```{r}
+#| label: load dataframe
+
+train_df <- load_split_df("train")
+```
+
+# Define variable roles
+
+```{r}
+#| label: define variable roles
+
+# id and time
+vars_id <- c(
+  "pid"
+)
+vars_time <- c(
+  "syear"
+)
+
+# case weights
+vars_weight <- c(
+  "weight"
+)
+
+# other metadata
+vars_meta <- c(
+  "hid",
+  "survey_sample",
+  "survey_status",
+  "parid",
+  "data_personal",
+  "data_pgen",
+  "data_household",
+  "data_hgen",
+  "data_hgross",
+  "housing_moved_in_year",
+  "job_nr_individual",
+  "job_nr_household"
+)
+
+# dependent variable
+vars_outcome <- c(
+  "depression_phq4_binary_in_1y"
+)
+
+# highly colinear variables.
+# newline between each group, comment out variables that should remain in the model
+vars_exclude <- c(
+  "income_net_individual",
+  # "income_net_household",
+
+  "income_satisfied_individual",
+  # "income_satisfied_household",
+
+  # "household_single",
+  "household_size",
+
+  # "overtime_ever",
+  # "overtime_hours_month",
+
+  # "health_description",
+  # "health_satisfaction",
+  "height_m",
+  "weight_kg",
+  # "bmi",
+  "obese",
+
+  # "chronic_illness",
+  # "disability_degree",
+
+  NA # added so vector end always works
+)
+
+vars_predictor <- train_df %>%
+  select(age:last_col()) %>%
+  colnames() %>%
+  setdiff(vars_exclude)
+
+# create roll identifier
+roles_df <- tibble(variable = colnames(train_df), role = NA) %>%
+  mutate(role = case_when(
+    variable %in% vars_id ~ "id",
+    variable %in% vars_time ~ "time",
+    variable %in% vars_meta ~ "metadata",
+    variable %in% vars_weight ~ "case_weights",
+    variable %in% vars_outcome ~ "outcome",
+    variable %in% vars_predictor ~ "predictor",
+    .default = "none"
+  ))
+
+save_roles_df(roles_df)
+
+roles_df %>%
+  rename_with(str_to_title) %>%
+  export_return("04_roles_variables", caption = "Role Assignment of Variables.", label = "roles_variables", tabular.environment = "longtable")
+```
+
+
+# Missingness Analysis
+## Overview of relevant cases
+
+Analysis will be conducted for "elevated depressive scores next year" scenario, as literature outlines that interventions work best if close to potential onset. I'll visualize the relevant years in order to see before state.
+
+```{r}
+#| label: visualize relevant years
+#| fig-width: 10
+#| fig-height: 10
+
+train_df %>%
+  select(syear, depression_phq4_binary_in_1y, all_of(vars_predictor)) %>%
+  filter_relevant() %>% # see imputation_helpers for implementation, only keeps rows where depression in 1y variables are not NA
+  na_heatmap_variables(highlight_borders = FALSE) -
+  partial(export_return, filename = "04_na-heatmap-variables_reconstructed-filtered", width = 10, height = 10)
+```
+
+```{r}
+#| label: get df of only predictors for missingness testing
+
+# make df with only the predictors. limiting to relevant rows as those are the ones i would want to impute
+predictors_df <- train_df %>%
+  filter_relevant() %>%
+  select(all_of(vars_predictor))
+```
+
+```{r}
+#| label: overall missingness
+
+predictors_df %>%
+  summarise(missing = mean(is.na(as.matrix(.))) * 100)
+```
+
+## Characteristics
+
+```{r}
+#| label: missingness characteristics
+
+# testing mcar assumption by estimating missingness with demographic variables.
+
+# get cols with more than 5% missingness to test
+cols_test <- predictors_df %>%
+  select(where(~ mean(is.na(.)) > 0.05)) %>%
+  colnames()
+
+get_lr <- function(df,
+                   outcome,
+                   predictors = c("age", "sex"),
+                   p_sig = 0.05) {
+  #' Get Likelihood ratio
+  #'
+  #' Get likelihood ratio test result of logit model "is specified outcome na" ~ predictors
+  #'
+  #' @param df : data frame
+  #' @param outcome : variable to test na predictability for
+  #' @param predictors : vector of columns to use as predictors in model
+  #' @param p_sig : double, significance level
+  #'
+  #' @return likelihood-ratio
+
+  df <- df %>%
+    mutate(outcome_isna = is.na(!!sym(outcome))) %>%
+    drop_na(all_of(c(predictors)))
+
+  formula <- reformulate(predictors, response = "outcome_isna")
+
+  model <- glm(formula, data = df, family = binomial(link = "logit"))
+  null_model <- glm(outcome_isna ~ 1,
+    data = df,
+    family = binomial(link = "logit")
+  )
+
+  shorten_vars <- function(v) {
+    v <- setdiff(v, "(Intercept)")
+    v <- predictors[map_lgl(predictors, function(x) {
+      any(grepl(x, v))
+    })]
+  }
+
+  report <- tibble(
+    outcome = outcome,
+    lr_p = lrtest(null_model, model)$`Pr(>Chisq)`[2],
+    mcfadden_r2 = 1 - as.numeric(logLik(model)) / as.numeric(logLik(null_model)),
+    predictors = summary(model)$coefficients %>%
+      as.data.frame() %>%
+      rename(p = "Pr(>|z|)") %>%
+      filter(p < p_sig) %>%
+      rownames() %>%
+      shorten_vars() %>%
+      paste(., collapse = ", ")
+  )
+
+  return(report)
+}
+
+# Bonferroni correction
+p <- 0.01 / length(cols_test)
+map_dfr(cols_test, ~ get_lr(df = predictors_df, outcome = ., p_sig = p)) %>%
+  rename(
+    Variable = outcome,
+    "Likelihood Ratio p-Value" = lr_p,
+    "McFadden's pseudo-R²" = mcfadden_r2,
+    "Significant Predictors" = predictors
+  ) %>%
+  export_return(
+    "04_mar_test",
+    caption = "Results of likelihood ratio tests. Compares logistic regression models predicting variable missingness with age and sex to an intercept-only baseline. Significance Level before Bonferroni Correction: 0.01.",
+    label = "mar_test",
+    tabular.environment = "tabularx",
+    align = c("l", "R", "R", "R"),
+    display = c("E", "E", "E", "f", "E"),
+    digits = c(1, 1, 1, 3, 1)
+  )
+```
+
+
+-> MCAR clearly broken, missingness in all variables with high missingness can be predicted even just with age & sex.
+-> only mar strategies available
+
+```{r}
+#| label: correlations between variables
+#| fig-width: 10
+#| fig-height: 10
+
+train_df %>%
+  select(all_of(roles_df %>% filter(role == "predictor") %>% pull(variable))) %>%
+  select(where(is.numeric)) %>%
+  correlate(quiet = TRUE) %>%
+  pivot_longer(-term, names_to = "term2", values_to = "corr") %>%
+  mutate(label = if_else(abs(corr) > 0.3, round(corr, 2), NA)) %>%
+  ggplot(aes(x = term, y = term2, fill = corr)) +
+  geom_tile() +
+  geom_text(aes(x = term, y = term2, label = label), color = "black", size = 2.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  fill_diverging(limits = c(-1, 1), midpoint = 0) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Correlation",
+    title = "Pearson Correlation Heatmap of Predictor Variables",
+    subtitle = "Using pairwise complete observations",
+    caption = ""
+  ) -
+  partial(export_return, filename = "04_correlations_predictors_heatmap", width = 10, height = 10)
+```
+
+
+
+## Complete Cases
+
+```{r}
+#| label: nr of complete cases
+
+predictors_df %>%
+  mutate(case_is_complete = complete.cases(.)) %>%
+  summarize(n_complete = sum(case_is_complete), n_total = n()) %>%
+  mutate(percent_complete = n_complete / n_total * 100)
+```
+
+```{r}
+#| label: nr of complete cases per year
+
+# per year
+train_df %>%
+  filter_relevant() %>%
+  select(syear, all_of(vars_predictor)) %>%
+  group_by(syear) %>%
+  mutate(case_is_complete = complete.cases(pick(everything()))) %>%
+  summarize(n_complete = sum(case_is_complete), n_total = n()) %>%
+  mutate(percent_complete = n_complete / n_total * 100)
+```
+
+## Within-Case
+
+```{r}
+#| label: within-case missingness
+
+within_case_missing_df <- predictors_df %>%
+  mutate(
+    sum = rowSums(across(everything(), is.na)),
+    percent = sum / ncol(.)
+  ) %>%
+  select(sum, percent)
+
+median_case_missingness <- within_case_missing_df %>%
+  summarize(avg = median(percent)) %>%
+  pull(avg)
+
+print(paste0("Missingness in median case: ", median_case_missingness * 100, "%"))
+```
+
+```{r}
+#| label: visualize within-case missingness
+#| fig-width: 5
+#| fig-height: 5
+
+within_case_missing_df %>%
+  mutate(is_median = percent == median_case_missingness) %>%
+  ggplot(aes(x = percent, fill = is_median)) +
+  geom_bar() +
+  theme_minimal() +
+  scale_fill_manual(
+    values = c(
+      "FALSE" = palette_qualitative[10],
+      "TRUE" = palette_qualitative[1]
+    )
+  ) +
+  scale_x_continuous(labels = scales::label_percent(accuracy = 1), breaks = seq(0, 1, 0.1)) +
+  guides(fill = "none") +
+  labs(
+    x = "% of missingness",
+    y = "Amount of Cases",
+    title = "Within-Case Missingness Distribution",
+    subtitle = paste0("Red bar marks median missingness (", round(median_case_missingness, 4) * 100, "%)"),
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "04_within_case_missingness_before_imputation",
+    width = 5,
+    height = 5
+  )
+```
+
+# Base Recipe
+
+Basic preprocessing template to ensure equal treatment of variables.
+
+```{r}
+#| label: base recipe
+
+recipe_base <- recipe(
+  x = train_df,
+  vars = roles_df$variable,
+  roles = roles_df$role
+) %>%
+  # make weight variable recognizable as weight
+  step_mutate(weight = importance_weights(weight)) %>%
+  # convert logicals to factors
+  step_mutate_at(all_logical(), fn = ~ factor(., levels = c(FALSE, TRUE))) %>%
+  # if outcome was logical, reverse order of levels
+  step_mutate_at(has_role("outcome") & where(is.factor), fn = fct_rev) %>%
+  # make all factors unordered
+  step_unorder(all_ordered_predictors()) %>%
+  # check for one-value variables (should not occur)
+  step_zv(all_predictors())
+
+recipe_base
+```
+
+# Train Imputation Techniques
+
+Implementing 3 types of strategies: 
+1. median/mode, 
+2. model-based with linear model for numeric & multinomial model for factors,
+3. bagged-tree
+
+
+## Define recipes
+
+```{r}
+#| label: no imputation
+
+recipe_none <- recipe_base
+```
+
+```{r}
+#| label: median mean imputation
+
+recipe_avg <- recipe_base %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors())
+```
+
+For model-based we need to restrict the imputation variables a bit to avoid high missingness affecting the model.
+
+```{r}
+#| label: model-based variables
+
+predictors_NA_df <- train_df %>%
+  select(all_of(vars_predictor)) %>%
+  mutate(across(everything(), is.na)) %>%
+  summarise(across(everything(), mean)) %>%
+  summarise(across(everything(), ~ scales::percent(., accuracy = 0.01))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "NA_percent"
+  ) %>%
+  arrange(NA_percent)
+
+predictors_NA_df %>%
+  rename(
+    Variable = variable,
+    "NA(%)" = NA_percent
+  ) %>%
+  export_return("04_na_predictors",
+    caption = "Percentage of missingness present in relevant predictors before stochastic imputation.",
+    label = "na_predictors"
+  )
+```
+- > natural cutoff point at 5/10%, big gap between education_level and overtime_ever. Additionally, retaining education level important to estimate workforce & income related variables.
+
+```{r}
+#| label: model-based var selection
+
+model_impute_vars <- predictors_NA_df %>%
+  filter(NA_percent <= 5) %>%
+  pull(variable)
+
+# colnames after preprocessing steps dont match colnames from before
+# due to dummy creation. dummy cols follow naming convention variableVALUE,
+# so matching with startswith should be possible.
+```
+
+```{r}
+#| label: model imputation
+
+recipe_model <- recipe_base %>%
+  # models require complete cases for the independent variables. thus two different procedures:
+  # if im in prep ie model training, then ill drop all non-complete rows for the model predictor variables.
+  # this way i only train on complete cases.
+  #
+  # if im instead in bake, then ill not delete anything but instead impute mean & mode for the model predictors.
+  step_naomit(starts_with(model_impute_vars), skip = TRUE) %>%
+  step_impute_mean(all_numeric() & starts_with(model_impute_vars)) %>%
+  step_impute_mode(all_factor() & starts_with(model_impute_vars)) %>%
+  # now do linear imputation for numeric, custom multinomial for factors.
+  step_impute_linear(all_numeric_predictors(), impute_with = starts_with(model_impute_vars)) %>%
+  step_impute_multinom(all_factor_predictors(), impute_with = starts_with(model_impute_vars))
+```
+
+```{r}
+#| label: bagged-tree imputation
+
+recipe_bag <- recipe_base %>%
+  step_impute_bag(all_predictors(), impute_with = imp_vars(all_predictors()))
+```
+
+
+## Precompute parameters
+
+```{r}
+#| label: prep no imputation
+
+start_time <- Sys.time()
+
+prep_none <- recipe_none %>%
+  prep(verbose = TRUE)
+
+end_time <- Sys.time()
+end_time - start_time
+rm(start_time, end_time)
+```
+
+```{r}
+#| label: prep median mode imputation
+
+start_time <- Sys.time()
+
+prep_avg <- recipe_avg %>%
+  prep(verbose = TRUE)
+
+end_time <- Sys.time()
+end_time - start_time
+rm(start_time, end_time)
+```
+
+```{r}
+#| label: prep model imputation
+
+start_time <- Sys.time()
+
+prep_model <- recipe_model %>%
+  prep(verbose = TRUE)
+
+end_time <- Sys.time()
+end_time - start_time
+rm(start_time, end_time)
+```
+
+```{r}
+#| label: prep bagged trees imputation
+
+start_time <- Sys.time()
+
+prep_bag <- recipe_bag %>%
+  prep(verbose = TRUE)
+
+end_time <- Sys.time()
+end_time - start_time
+rm(start_time, end_time)
+```
+
+```{r}
+#| label: export prep recipes
+
+save_recipe(prep_none, "none")
+save_recipe(prep_avg, "avg")
+save_recipe(prep_model, "model")
+save_recipe(prep_bag, "bag")
+```
+
+# Impute train_df
+
+## Load recipes
+
+```{r}
+#| label: load prep recipes
+
+prep_none <- load_recipe("none")
+prep_avg <- load_recipe("avg")
+prep_model <- load_recipe("model")
+prep_bag <- load_recipe("bag")
+```
+
+## Impute
+
+```{r}
+#| label: run no imputation
+
+impute_df_none <- prep_none %>%
+  bake(new_data = filter_relevant(train_df))
+```
+
+```{r}
+#| label: run median mode imputation
+
+impute_df_avg <- prep_avg %>%
+  bake(new_data = filter_relevant(train_df))
+```
+
+```{r}
+#| label: run model imputation
+
+impute_df_model <- prep_model %>%
+  bake(new_data = filter_relevant(train_df))
+```
+
+```{r}
+#| label: run bagged trees imputation
+
+impute_df_bag <- prep_bag %>%
+  bake(new_data = filter_relevant(train_df))
+```
+
+```{r}
+#| label: save imputed dfs
+
+save_imputed_df(impute_df_none, imp = "none")
+save_imputed_df(impute_df_avg, imp = "avg")
+save_imputed_df(impute_df_model, imp = "model")
+save_imputed_df(impute_df_bag, imp = "bag")
+```
+
+# Distribution Comparison
+
+```{r}
+#| label: load datasets
+
+impute_df_none <- load_imputed_df("none")
+impute_df_avg <- load_imputed_df("avg")
+impute_df_model <- load_imputed_df("model")
+impute_df_bag <- load_imputed_df("bag")
+
+roles_df <- load_roles_df()
+```
+
+```{r}
+#| label: unify into one
+
+cols_predictors <- roles_df %>%
+  filter(role == "predictor") %>%
+  pull(variable)
+
+cols_ordered <- impute_df_none %>%
+  select(all_of(cols_predictors)) %>%
+  summarize(across(everything(), \(x) {
+    sum(is.na(x)) / length(x) * 100
+  })) %>%
+  pivot_longer(
+    cols = -c(),
+    names_to = "variable",
+    values_to = "percent"
+  ) %>%
+  filter(percent >= 1) %>%
+  mutate(label = paste0(variable, " (", floor(percent * 100) / 100, "%)")) %>%
+  arrange(desc(percent)) %>%
+  {
+    setNames(.$label, .$variable)
+  }
+
+
+impute_df_all <- impute_df_none %>%
+  mutate("imputation" = "none") %>%
+  bind_rows(impute_df_avg %>%
+    mutate("imputation" = "avg")) %>%
+  bind_rows(impute_df_model %>%
+    mutate("imputation" = "model")) %>%
+  bind_rows(impute_df_bag %>%
+    mutate("imputation" = "bag")) %>%
+  select(pid, syear, imputation, all_of(cols_predictors)) %>%
+  mutate(imputation = fct_inorder(imputation))
+
+impute_df_numeric <- impute_df_all %>%
+  select(pid, syear, imputation, where(is.numeric)) %>%
+  pivot_longer(
+    cols = -c(pid, syear, imputation),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = factor(variable, levels = names(cols_ordered)))
+
+
+impute_df_factor <- impute_df_all %>%
+  select(pid, syear, imputation, where(is.factor)) %>%
+  pivot_longer(
+    cols = -c(pid, syear, imputation),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = factor(variable, levels = names(cols_ordered)))
+```
+
+```{r}
+#| label: plot differences
+#| fig-width: 10
+#| fig-height: 75
+
+plot_variable <- function(colname, df_numeric, df_factor) {
+  # determine if we're plotting a numeric or factor variable & get data
+  if (colname %in% df_numeric$variable) {
+    col_numeric <- TRUE
+    dat <- filter(df_numeric, variable == colname) %>%
+      drop_na()
+  } else {
+    col_numeric <- FALSE
+    dat <- filter(df_factor, variable == colname) %>%
+      drop_na()
+  }
+
+  # common baseline for every plot
+  plot <- ggplot(dat, aes(x = value, fill = imputation, color = imputation)) +
+    facet_wrap(~imputation, scales = "free_x", nrow = 1) +
+    theme_minimal() +
+    scale_fill_manual(
+      values = c(
+        "none" = palette_qualitative[10],
+        "avg" = palette_qualitative[1],
+        "model" = palette_qualitative[2],
+        "bag" = palette_qualitative[3]
+      )
+    ) +
+    scale_color_manual(
+      values = c(
+        "none" = palette_qualitative[10],
+        "avg" = palette_qualitative[1],
+        "model" = palette_qualitative[2],
+        "bag" = palette_qualitative[3]
+      )
+    ) +
+    guides(color = "none") +
+    guides(fill = "none") +
+    theme(
+      plot.title = element_text(
+        size = 10,
+        hjust = 0.5,
+        face = NULL,
+        margin = margin(b = 5)
+      )
+    ) +
+    labs(title = cols_ordered[[colname]], x = "", y = "")
+
+  if (col_numeric & n_distinct(dat %>% filter(imputation == "none") %>% pull(value)) > 20) {
+    # col is numeric and likely continuous
+    x_limits <- dat %>%
+      filter(imputation == "none") %>%
+      summarize(
+        lower = quantile(value, 0.01),
+        upper = quantile(value, 0.99),
+        lower_round = floor(quantile(value, 0.01) / 5) * 5,
+        upper_round = ceiling(quantile(value, 0.99) / 5) * 5,
+      )
+
+    plot <- plot +
+      scale_x_continuous(
+        trans = scales::pseudo_log_trans(base = 10),
+        breaks = {
+          x <- seq(
+            log(x_limits$lower_round + 1),
+            log(x_limits$upper_round + 1),
+            length.out = 8
+          )
+          x <- exp(x) - 1
+          x <- sign(x) * floor(abs(x) + 0.5)
+          unique(x)
+        },
+        labels = label_number(accuracy = 1, scale_cut = cut_short_scale())
+      ) +
+      coord_cartesian(xlim = c(x_limits$lower_round, x_limits$upper_round)) +
+      geom_density(alpha = 0.2)
+  } else if (col_numeric) {
+    # variable is numeric & has few possible values
+    plot <- plot +
+      geom_histogram(
+        aes(y = after_stat(density)), # only works bc of binwidth = 1, bc probability = density*width!
+        binwidth = 1,
+        alpha = 0.2
+      ) +
+      scale_x_continuous(
+        breaks = seq(min(dat$value), max(dat$value), by = 1),
+        labels = label_number(scale_cut = cut_short_scale())
+      )
+  } else {
+    # variable is not numeric, is factor
+    plot <- plot +
+      geom_bar(
+        aes(y = after_stat(prop), group = 1),
+        alpha = 0.2
+      ) +
+      theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1))
+  }
+
+  return(plot)
+}
+
+
+# all plots, split for appendix pages
+plot_split_interval <- 5
+plot_first_page <- 3 # first page should only contain 3 plots
+plot_splits <- c(1, seq(plot_first_page + 1, length(cols_ordered), by = plot_split_interval))
+
+impute_dist_plots <- map(
+  names(cols_ordered),
+  \(x) plot_variable(x, impute_df_numeric, impute_df_factor)
+) %>%
+  # remove imputation technique label from all but first plot
+  imap(\(plot, i) {
+    if (i %in% plot_splits) {
+      plot
+    } else {
+      plot + theme(strip.text = element_blank())
+    }
+  })
+
+# split into chunks of 5
+for (img_nr in seq_along(plot_splits)) {
+  i <- plot_splits[img_nr]
+  if (img_nr < length(plot_splits)) {
+    # not yet last plot
+    end <- plot_splits[img_nr + 1] - 1
+  } else {
+    # last plot
+    end <- length(impute_dist_plots)
+  }
+
+  wrap_plots(impute_dist_plots[i:end], ncol = 1) +
+    plot_annotation(
+      title = "Distribution of Predictor Variables before & after Imputation",
+      subtitle = "Percentage indicates Missingness before Imputation"
+    ) -
+    partial(export_return,
+      filename = paste0("04_imputation_predictors_before_after_", img_nr),
+      width = 10,
+      height = (end - i + 1) * 3
+    )
+}
+
+# select plots only
+main_text_ids <- match(c("friends_frequency", "neighbourhood_cohesion"), names(cols_ordered))
+wrap_plots(impute_dist_plots[main_text_ids], ncol = 1) +
+  plot_annotation(
+    title = "Distribution of Predictor Variables before & after Imputation",
+    subtitle = "Percentage indicates Missingness before Imputation"
+  ) -
+  partial(export_return,
+    filename = paste0("04_imputation_predictors_before_after_selection"),
+    width = 10,
+    height = 6,
+    limitsize = FALSE
+  )
+
+
+# all plots in one image
+wrap_plots(impute_dist_plots, ncol = 1) +
+  plot_annotation(
+    title = "Distribution of Predictor Variables before & after Imputation",
+    subtitle = "Percentage indicates Missingness before Imputation"
+  ) -
+  partial(export_return,
+    filename = paste0("04_imputation_predictors_before_after"),
+    width = 10,
+    height = 75,
+    limitsize = FALSE
+  )
+```

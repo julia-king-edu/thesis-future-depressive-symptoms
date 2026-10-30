@@ -1,0 +1,413 @@
+---
+title: "Model Selection"
+author: "Julia King"
+format: 
+  html:
+    embed-resources: true
+---
+
+# Load resources
+
+```{r}
+#| label: load packages
+#| message: false # removes tidyverse loader & here location for privacy
+#| warning: false
+
+library(tidyverse)
+library(here)
+library(tidymodels)
+library(probably)
+
+source(here("functions", "set_env-variables.R"))
+source(file.path(PATH_FUNCTIONS, "load_functions.R"))
+```
+
+```{r}
+#| label: load model sets
+
+# wfset_avg <- load_wf_set("avg")
+# wfset_model <- load_wf_set("model")
+# wfset_bag <- load_wf_set("bag")
+#
+# wfsets <- list(
+#   "avg" = wfset_avg,
+#   "model" = wfset_model,
+#   "bag" = wfset_bag
+# )
+# sets became too big to load into memory at once, need to load and unload sequentially
+
+wfset_ids <- c(
+  avg = "avg",
+  model = "model",
+  bag = "bag"
+)
+```
+
+
+# Extract Selection Metrics
+
+```{r}
+#| label: set selection metric
+
+selection_metric <- "average_precision"
+```
+
+```{r}
+#| label: get best result per imp and spec
+
+extract_selection_metrics <- function(wfsets,
+                                      selection_metric = "average_precision",
+                                      selection_metric_max = TRUE) {
+  # get combined table (just the ones returned by rank_results)
+  selection_metrics_norank <- imap(wfset_ids, \(id, imp) {
+    # load new wfset
+    x <- load_wf_set(id)
+    # extract metrics
+    all_configs <- x %>%
+      rank_results() %>%
+      filter(.metric == selection_metric) %>%
+      group_by(wflow_id)
+    if (selection_metric_max) {
+      best_configs <- all_configs %>%
+        filter(mean == max(mean, na.rm = TRUE)) %>%
+        slice_max(mean, n = 1) %>%
+        select(wflow_id, .config)
+    } else {
+      best_configs <- all_configs %>%
+        filter(mean == min(mean, na.rm = TRUE)) %>%
+        select(wflow_id, .config)
+    }
+    out <- x %>%
+      rank_results() %>%
+      right_join(best_configs, by = join_by(wflow_id, .config)) %>%
+      mutate(imp = imp) %>%
+      relocate(imp)
+    # remove from memory
+    rm(x)
+    gc()
+    # end
+    print(paste0(imp, " done!"))
+    return(out)
+  })
+
+  selection_metrics_norank <- selection_metrics_norank %>%
+    bind_rows() %>%
+    select(-c(rank, n, preprocessor)) # rank not meaningful, n & preprocessor static (5 & recipe)
+
+
+  if (selection_metric_max) {
+    rank_table <- selection_metrics_norank %>%
+      filter(.metric == selection_metric) %>%
+      mutate(rank = min_rank(desc(mean))) %>%
+      select(imp, wflow_id, .config, rank)
+  } else {
+    rank_table <- selection_metrics_norank %>%
+      filter(.metric == selection_metric) %>%
+      mutate(rank = min_rank(mean)) %>%
+      select(imp, wflow_id, .config, rank)
+  }
+
+  selection_metrics <- selection_metrics_norank %>%
+    left_join(rank_table,
+      by = join_by(imp, wflow_id, .config),
+      relationship = "many-to-one"
+    ) %>%
+    relocate(rank, imp, model, wflow_id) %>%
+    mutate(is_selection_metric = if_else(.metric == selection_metric, TRUE, FALSE)) %>%
+    arrange(rank, desc(is_selection_metric)) %>%
+    select(-is_selection_metric) %>%
+    rename_with(~ sub("^\\.", "", .x)) # remove leading . from .metric & .config
+
+  return(selection_metrics)
+}
+
+
+selection_metrics <- extract_selection_metrics(wfset_ids, selection_metric = selection_metric)
+```
+
+```{r}
+#| label: export selection metrics
+
+selection_metrics %>%
+  mutate(value = paste0(round(mean, 5), " (", round(std_err, 5), ")")) %>%
+  select(-c(mean, std_err)) %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  select(-c("wflow_id", "config")) %>%
+  mutate(
+    model = case_when(
+      model == "boost_tree" ~ "Gradient Boosting",
+      model == "rand_forest" ~ "Random Forest",
+      model == "logistic_reg" ~ "Elastic Net",
+      TRUE ~ NA
+    ),
+    imp = case_when(
+      imp == "avg" ~ "median/mode",
+      imp == "model" ~ "model-based",
+      imp == "bag" ~ "bagged trees",
+      TRUE ~ NA
+    )
+  ) %>%
+  rename(
+    "#" = rank,
+    Imp = imp,
+    Model = model,
+    "Avg. Prec." = average_precision,
+    "Brier Score" = brier_class,
+    "Log Loss" = mn_log_loss,
+    "PR AUC" = pr_auc,
+    "ROC AUC" = roc_auc
+  ) %>%
+  export_return(
+    "06_metrics_tune",
+    caption = "Threshold-independent Metrics of all tuned models. Standard Errors in Brackets. Best Performances per Metric are highlighted in bold.",
+    label = "metrics_tune",
+    tabular.environment = "tabularx",
+    align = c("r", "L", "L", "R"),
+    break.chars = c("_", "/")
+  )
+
+# find position of highest value per metric so i know what to bold
+# determine best value for each metric
+bold <- selection_metrics %>%
+  group_by(metric) %>%
+  mutate(
+    bold = case_when(
+      metric %in% c("brier_class", "mn_log_loss") ~
+        mean == min(mean, na.rm = TRUE),
+      TRUE ~
+        mean == max(mean, na.rm = TRUE)
+    )
+  ) %>%
+  ungroup() %>%
+  select(rank, metric, bold) %>%
+  pivot_wider(
+    names_from = metric,
+    values_from = bold,
+    values_fill = FALSE
+  ) %>%
+  arrange(rank) %>%
+  select(
+    average_precision,
+    brier_class,
+    mn_log_loss,
+    pr_auc,
+    roc_auc
+  )
+
+# add columns that should never be bold
+bold <- bind_cols(
+  matrix(FALSE, nrow = nrow(bold), ncol = 3),
+  bold
+) %>%
+  as.matrix()
+
+# add bold formatting to exported LaTeX
+tex <- readLines(file.path(PATH_TABLE, "06_metrics_tune.tex"))
+
+rows <- grep("^\\s+[0-9]+\\s+&", tex)
+
+for (i in seq_along(rows)) {
+  row <- tex[rows[i]]
+
+  # separate table row from trailing LaTeX row terminator
+  parts <- strsplit(row, "\\\\\\\\", perl = TRUE)[[1]]
+  cells <- strsplit(parts[1], " & ", fixed = TRUE)[[1]]
+
+  for (j in seq_len(ncol(bold))) {
+    if (bold[i, j]) {
+      cells[j] <- paste0("\\textbf{", cells[j], "}")
+    }
+  }
+
+  tex[rows[i]] <- paste0(paste(cells, collapse = " & "), " \\\\")
+}
+
+writeLines(tex, file.path(PATH_TABLE, "06_metrics_tune.tex"))
+```
+
+```{r}
+#| label: avg prec only
+
+selection_metrics %>%
+  filter(metric == "average_precision") %>%
+  mutate(
+    value = paste0(round(mean, 5), " (", round(std_err, 5), ")"),
+    model = case_when(
+      model == "boost_tree" ~ "Gradient Boosting",
+      model == "rand_forest" ~ "Random Forest",
+      model == "logistic_reg" ~ "Elastic Net",
+      TRUE ~ NA
+    ),
+    imp = case_when(
+      imp == "avg" ~ "median/mode",
+      imp == "model" ~ "model-based",
+      imp == "bag" ~ "bagged trees",
+      TRUE ~ NA
+    )
+  ) %>%
+  select(rank, imp, model, value) %>%
+  rename(
+    "#" = rank,
+    Imp = imp,
+    Model = model,
+    `Avg. Prec.` = value
+  ) %>%
+  export_return(
+    "06_avg_prec_tune",
+    caption = "Average Precision of all tuned models. Standard Errors in Brackets.",
+    label = "tune_avg_prec",
+    tabular.environment = "tabularx",
+    align = c("r", "L", "L", "R"),
+    break.chars = c("_", "/")
+  )
+```
+
+```{r}
+#| label: difference between best and worst combination
+
+# absolute increase
+selection_metrics %>%
+  filter(metric == "average_precision") %>%
+  arrange(rank) %>%
+  filter(rank %in% c(1, 9)) %>%
+  pull(mean) %>%
+  {
+    .[1] - .[2]
+  }
+
+# relative increase
+selection_metrics %>%
+  filter(metric == "average_precision") %>%
+  arrange(rank) %>%
+  filter(rank %in% c(1, 9)) %>%
+  pull(mean) %>%
+  {
+    (.[1] - .[2]) / .[2]
+  }
+```
+
+# Plot Model Performance
+
+```{r}
+#| label: tuned model comparison
+#| fig-width: 10
+#| fig-height: 6
+
+selection_metrics %>%
+  filter(metric == selection_metric) %>%
+  mutate(
+    model = case_when(
+      model == "boost_tree" ~ "Gradient Boosting",
+      model == "rand_forest" ~ "Random Forest",
+      model == "logistic_reg" ~ "Elastic Net",
+      TRUE ~ NA
+    ),
+    imp = case_when(
+      imp == "avg" ~ "median/mode",
+      imp == "model" ~ "model-based",
+      imp == "bag" ~ "bagged trees",
+      TRUE ~ NA
+    ),
+  ) %>%
+  arrange(rank) %>%
+  ggplot(aes(x = mean, y = fct_rev(fct_inorder(paste(model, "\n", imp, sep = ""))), color = model, shape = imp)) +
+  geom_point(size = 5) +
+  geom_errorbar(aes(xmin = mean - 1.96 * std_err, xmax = mean + 1.96 * std_err), width = 0.1) +
+  theme_minimal() +
+  guides(shape = "none") +
+  guides(color = "none") +
+  color_qualitative() +
+  labs(
+    x = "mean",
+    y = "",
+    color = "Model Specification",
+    shape = "Imputation Technique",
+    title = "Average Precision per model x imputation technique combination",
+    subtitle = "Truncated x-axis for interpretability",
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "06_tuning-performance",
+    width = 10,
+    height = 6
+  )
+```
+
+```{r}
+#| label: tuned model comparison w full scale
+#| fig-width: 10
+#| fig-height: 6
+
+selection_metrics %>%
+  filter(metric == selection_metric) %>%
+  mutate(
+    model = case_when(
+      model == "boost_tree" ~ "Gradient Boosting",
+      model == "rand_forest" ~ "Random Forest",
+      model == "logistic_reg" ~ "Elastic Net",
+      TRUE ~ NA
+    ),
+    imp = case_when(
+      imp == "avg" ~ "median/mode",
+      imp == "model" ~ "model-based",
+      imp == "bag" ~ "bagged trees",
+      TRUE ~ NA
+    ),
+  ) %>%
+  arrange(rank) %>%
+  ggplot(aes(x = mean, y = fct_rev(fct_inorder(paste(model, "\n", imp, sep = ""))), color = model, shape = imp)) +
+  geom_point(size = 2.5) +
+  geom_errorbar(aes(xmin = mean - 1.96 * std_err, xmax = mean + 1.96 * std_err), width = 0.1) +
+  scale_x_continuous(limits = c(0.0, 1.0)) +
+  theme_minimal() +
+  guides(shape = "none") +
+  guides(color = "none") +
+  color_qualitative() +
+  labs(
+    x = "mean",
+    y = "",
+    color = "Model Specification",
+    shape = "Imputation Technique",
+    title = "Average Precision per model x imputation technique combination",
+    subtitle = "Full x-axis for contextualization",
+    caption = ""
+  ) -
+  partial(export_return,
+    filename = "06_tuning-performance_full",
+    width = 10,
+    height = 6
+  )
+```
+
+# Determine & Train best Model
+
+```{r}
+#| label: get best wf
+
+selected_config <- list(
+  imp = selection_metrics %>% filter(rank == 1, metric == selection_metric) %>% pull(imp),
+  wf = selection_metrics %>% filter(rank == 1, metric == selection_metric) %>% pull(wflow_id),
+  config = selection_metrics %>% filter(rank == 1, metric == selection_metric) %>% pull(config),
+  threshold = NA
+)
+
+# load wfset of chosen imputation technique
+selected_wfset <- load_wf_set(selected_config[["imp"]])
+
+selected_params <- selected_wfset %>%
+  extract_workflow_set_result(selected_config[["wf"]]) %>%
+  select_best(metric = selection_metric)
+
+selected_wf <- selected_wfset %>%
+  extract_workflow(selected_config[["wf"]]) %>%
+  finalize_workflow(selected_params)
+```
+
+# Export
+
+```{r}
+#| label: export
+
+save_selected_config(selected_config, threshold = FALSE)
+save_selected_wf(selected_wf)
+```
