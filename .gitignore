@@ -22,10 +22,6 @@ documents/manuscript/build/*
 # latex bib file (autoexported by zotero, different per computer)
 documents/manuscript/bib/citations.bib
 
-# renv
-renv.lock
-renv/*
-
 # LaTeX
 *.aux
 *.log
