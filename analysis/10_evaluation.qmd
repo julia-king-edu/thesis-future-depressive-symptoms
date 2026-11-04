@@ -36,10 +36,24 @@ selected_config <- load_selected_config(threshold = TRUE)
 
 f2_meas <- metric_tweak("f2_meas", f_meas, beta = 2)
 
+# brier score function is broken so i need to fix it after the fact:
+calculate_brier <- function(data) {
+  phq2_true <- as.numeric(data$depression_phq4_binary_in_1y == "TRUE")
+  pred_true <- data$.pred_TRUE
+  weights <- as.double(data$weight)
+
+  valid <- complete.cases(phq2_true, pred_true, weights)
+
+  weighted.mean(
+    (phq2_true[valid] - pred_true[valid])^2,
+    weights = weights[valid]
+  )
+}
+
 eval_metric_info <- list(
   list(fn = "average_precision", label = "Average Precision", type = "Classification", threshold = "independent"),
   list(fn = "roc_auc", label = "ROC-AUC", type = "Classification", threshold = "independent"),
-  list(fn = "brier_class", label = "Brier Score", type = "Probabilistic", threshold = "independent"),
+  list(fn = "brier_class", label = "Brier Score", type = "Probabilistic", threshold = "independent"), # kept so i have the entry where i want it, value is overwritten later
   list(fn = "mn_log_loss", label = "Mean Log Loss", type = "Probabilistic", threshold = "independent"),
   list(fn = "f2_meas", label = "F2-Score", type = "Classification", threshold = "dependent"),
   list(fn = "bal_accuracy", label = "Balanced Accuracy", type = "Classification", threshold = "dependent"),
@@ -78,6 +92,13 @@ cv_metrics <- resample_preds %>%
     .pred_TRUE,
     case_weights = weight
   ) %>%
+  mutate(
+    .estimate = if_else(
+      .metric == "brier_class",
+      calculate_brier(resample_preds),
+      .estimate
+    )
+  ) %>%
   mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
   select(-.estimator) %>%
   left_join(eval_metric_info,
@@ -107,6 +128,13 @@ fold_metrics <- resample_preds %>%
       .pred_TRUE,
       case_weights = weight
     ) %>%
+  mutate(
+    .estimate = if_else(
+      .metric == "brier_class",
+      calculate_brier(.x),
+      .estimate
+    )
+  ) %>%
       bind_cols(.y, .)
   }, .keep = TRUE) %>%
   bind_rows() %>%
@@ -514,6 +542,61 @@ domain_importance_df %>%
 test_preds <- load_predicted_df(type = "test")
 ```
 
+## baseline comparison 
+
+```{r}
+#| label: compute eval metrics for test set baseline
+
+set.seed(123)
+
+p_train <- resample_preds %>%
+  summarize(p_true = weighted.mean(
+    depression_phq4_binary_in_1y == TRUE,
+    w = as.double(weight),
+    na.rm = TRUE
+  )) %>%
+  pull(p_true)
+
+set.seed(94)
+baseline_preds <- test_preds %>%
+  mutate(
+    .pred_TRUE = p_train,
+    .pred_FALSE = 1 - p_train,
+    .pred_class = factor(
+      if_else(runif(n()) <= p_train, TRUE, FALSE),
+      levels = c(TRUE, FALSE)
+    )
+  )
+
+baseline_metrics <- baseline_preds %>%
+  eval_metric_set(
+    truth = depression_phq4_binary_in_1y,
+    estimate = .pred_class,
+    .pred_TRUE,
+    case_weights = weight
+  ) %>%
+  mutate(
+    .estimate = if_else(
+      .metric == "brier_class",
+      calculate_brier(baseline_preds),
+      .estimate
+    )
+  ) %>%
+  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
+  select(-.estimator) %>%
+  left_join(eval_metric_info, by = join_by(.metric == fn))
+
+
+baseline_metrics %>%
+  select(-c(".metric")) %>%
+  relocate(label) %>%
+  select(
+    Metric = label,
+    Estimate = .estimate
+  ) %>%
+  export_return("10_metrics_baseline", caption = "Performance Metrics based on the Baseline model. ", label = "metrics_baseline")
+```
+
 ## get metrics
 
 ```{r}
@@ -525,6 +608,13 @@ test_metrics <- test_preds %>%
     estimate = .pred_class,
     .pred_TRUE,
     case_weights = weight
+  ) %>%
+  mutate(
+    .estimate = if_else(
+      .metric == "brier_class",
+      calculate_brier(test_preds),
+      .estimate
+    )
   ) %>%
   mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
   select(-.estimator) %>%
@@ -658,55 +748,6 @@ test_preds %>%
     )
   ) -
   partial(export_return, filename = "10_score-vs-predicted", width = 5, height = 5)
-```
-
-
-# test set baseline comparison 
-
-```{r}
-#| label: compute eval metrics for test set baseline
-
-set.seed(123)
-
-p_train <- resample_preds %>%
-  summarize(p_true = weighted.mean(
-    depression_phq4_binary_in_1y == TRUE,
-    w = as.double(weight),
-    na.rm = TRUE
-  )) %>%
-  pull(p_true)
-
-set.seed(94)
-baseline_preds <- test_preds %>%
-  mutate(
-    .pred_TRUE = p_train,
-    .pred_FALSE = 1 - p_train,
-    .pred_class = factor(
-      if_else(runif(n()) <= p_train, TRUE, FALSE),
-      levels = c(TRUE, FALSE)
-    )
-  )
-
-baseline_metrics <- baseline_preds %>%
-  eval_metric_set(
-    truth = depression_phq4_binary_in_1y,
-    estimate = .pred_class,
-    .pred_TRUE,
-    case_weights = weight
-  ) %>%
-  mutate(.metric = factor(.metric, levels = levels(eval_metric_info$fn))) %>%
-  select(-.estimator) %>%
-  left_join(eval_metric_info, by = join_by(.metric == fn))
-
-
-baseline_metrics %>%
-  select(-c(".metric")) %>%
-  relocate(label) %>%
-  select(
-    Metric = label,
-    Estimate = .estimate
-  ) %>%
-  export_return("10_metrics_baseline", caption = "Performance Metrics based on the Baseline model. ", label = "metrics_baseline")
 ```
 
 # combined tables

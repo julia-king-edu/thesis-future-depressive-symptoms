@@ -194,7 +194,7 @@ library(xtable)
 
       x <- str_replace_all(
         x,
-        fixed(latex_char),
+        stringr::fixed(latex_char),
         paste0(latex_char, "\\allowbreak ")
       )
     }
