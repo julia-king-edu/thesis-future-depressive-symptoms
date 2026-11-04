@@ -230,7 +230,7 @@ sparse_df %>%
 #| fig-width: 10
 
 sparse_df %>%
-  select(syear, depression_phq4_binary_in_1y, age, sex:last_col()) %>%
+  select(syear, depression_phq2_binary_in_1y = depression_phq4_binary_in_1y, age, sex:last_col()) %>%
   filter(syear >= 2013) %>%
   na_heatmap_variables(bold_variables = c("smoker")) -
   partial(export_return, filename = "02_na-heatmap-variables_sparse", width = 10, height = 9)
@@ -250,7 +250,7 @@ na_heatmap_groups(
     select(
       survey_sample,
       syear,
-      depression_phq4_binary_in_1y,
+      depression_phq2_binary_in_1y = depression_phq4_binary_in_1y,
       age,
       sex:last_col()
     ),
@@ -1106,7 +1106,7 @@ The 2 variables missing compared to the full table are "job_nr_individual" and "
 #| fig-height: 9
 
 reconstructed_df %>%
-  select(syear, depression_phq4_binary_in_1y, age:last_col()) %>%
+  select(syear, depression_phq2_binary_in_1y = depression_phq4_binary_in_1y, age:last_col()) %>%
   na_heatmap_variables(bold_variables = c("belief_little_control_life", "character_optimism")) -
   partial(export_return, filename = "02_na-heatmap-variables_reconstructed", width = 10, height = 9)
 ```

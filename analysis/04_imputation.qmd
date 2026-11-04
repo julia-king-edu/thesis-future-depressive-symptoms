@@ -121,6 +121,7 @@ roles_df <- tibble(variable = colnames(train_df), role = NA) %>%
 save_roles_df(roles_df)
 
 roles_df %>%
+  mutate(variable = str_replace(variable, "phq4", "phq2")) %>%
   rename_with(str_to_title) %>%
   export_return("04_roles_variables", caption = "Role Assignment of Variables.", label = "roles_variables", tabular.environment = "longtable")
 ```
@@ -139,6 +140,7 @@ Analysis will be conducted for "elevated depressive scores next year" scenario, 
 train_df %>%
   select(syear, depression_phq4_binary_in_1y, all_of(vars_predictor)) %>%
   filter_relevant() %>% # see imputation_helpers for implementation, only keeps rows where depression in 1y variables are not NA
+  rename(depression_phq2_binary_in_1y = depression_phq4_binary_in_1y) %>%
   na_heatmap_variables(highlight_borders = FALSE) -
   partial(export_return, filename = "04_na-heatmap-variables_reconstructed-filtered", width = 10, height = 10)
 ```
@@ -226,13 +228,13 @@ p <- 0.01 / length(cols_test)
 map_dfr(cols_test, ~ get_lr(df = predictors_df, outcome = ., p_sig = p)) %>%
   rename(
     Variable = outcome,
-    "Likelihood Ratio p-Value" = lr_p,
+    "LR p-Value" = lr_p,
     "McFadden's pseudo-R²" = mcfadden_r2,
     "Significant Predictors" = predictors
   ) %>%
   export_return(
     "04_mar_test",
-    caption = "Results of likelihood ratio tests. Compares logistic regression models predicting variable missingness with age and sex to an intercept-only baseline. Significance Level before Bonferroni Correction: 0.01.",
+    caption = "Results of likelihood ratio tests. Compares logistic regression models predicting variable missingness with age and sex to intercept-only baselines. 0.0E+00 indicates numerical underflow. $\\alpha$ before correction: 0.01.",
     label = "mar_test",
     tabular.environment = "tabularx",
     align = c("l", "R", "R", "R"),
